@@ -1,0 +1,162 @@
+/* empower-fin Dashboard Portal 0.6.0
+   Responsive system: phone / tablet / laptop / desktop.
+   This layer deliberately overrides the older responsive-v1 rules rather than
+   requiring every existing dashboard component to be rewritten at once. */
+
+html, body { max-width: 100%; overflow-x: hidden; }
+img, svg, canvas, video { max-width: 100%; }
+button, input, select, textarea { max-width: 100%; }
+
+:focus-visible {
+  outline: 3px solid rgba(177, 91, 232, .42);
+  outline-offset: 2px;
+}
+
+/* Tablet: preserve the 12-column analytical layout where it still fits, but
+   stop cards from becoming narrower than their useful content. */
+@media (max-width: 1080px) {
+  .wrap, .topbar-inner { max-width: 100%; }
+  .g-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .g-3 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .g-12 { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  .card { min-width: 0; }
+  .card-hd { min-width: 0; }
+  .card-title, .card-note { min-width: 0; }
+  .head-actions { flex-wrap: wrap; }
+  .funnel-row { grid-template-columns: minmax(110px, 140px) minmax(0, 1fr) auto; }
+  .hbar-row { grid-template-columns: minmax(90px, 118px) minmax(0, 1fr) 54px; }
+  .wellness-right { min-width: 0; }
+}
+
+/* Laptop / small tablet: desktop navigation can consume too much horizontal
+   space, so let it compress without changing the desktop visual hierarchy. */
+@media (max-width: 900px) {
+  .topbar-inner { gap: 10px !important; }
+  .nav-inline { gap: 0; }
+  .nav-link { padding-left: 8px; padding-right: 8px; }
+  .nav-emp { max-width: 150px; }
+  .topbar-meta { min-width: 0; }
+  .topbar-meta > * { min-width: 0; }
+  .filters { gap: 8px; }
+}
+
+/* Phone: one-column dashboard, touch-first controls, and no accidental page
+   horizontal scrolling. Inline grid-column spans from the original prototype
+   are deliberately neutralised here. */
+@media (max-width: 640px) {
+  .wrap { padding: 0 12px 42px !important; }
+  .topbar-inner { padding: 0 12px !important; height: 58px !important; }
+  .topbar { position: sticky; }
+
+  .topbar-divider,
+  .audience-switch,
+  .nav-inline,
+  .data-fresh { display: none !important; }
+  .topbar-meta { margin-left: auto; }
+  .topbar-spacer { display: block; }
+
+  .head { padding: 20px 0 14px !important; gap: 14px; align-items: flex-start; }
+  .head h1 { font-size: clamp(25px, 8vw, 32px) !important; letter-spacing: -.5px; }
+  .head-sub { font-size: 13px; line-height: 1.5; }
+  .head-actions { width: 100%; }
+  .head-actions .btn { flex: 1 1 140px; justify-content: center; }
+
+  .filters {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 8px !important;
+    margin-bottom: 16px !important;
+    padding: 10px;
+    background: rgba(255,255,255,.72);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+  }
+  .filters > * { width: 100% !important; min-width: 0 !important; max-width: none !important; }
+  .filters .seg { overflow-x: auto; flex-wrap: nowrap !important; }
+  .filters .seg button { flex: 1 0 auto; min-height: 42px; white-space: nowrap; }
+  .filter-emp, .filter-month { width: 100% !important; min-height: 44px; border-radius: 11px; }
+  .period-picker-label { margin: 2px 2px -2px !important; }
+  .filter-tag { min-height: 40px; justify-content: space-between; border-radius: 10px; }
+
+  .grid, .g-4, .g-3, .g-2 { grid-template-columns: minmax(0, 1fr) !important; }
+  .g-12 { grid-template-columns: minmax(0, 1fr) !important; gap: 12px !important; }
+  .section-gap { margin-top: 12px !important; }
+
+  /* Original inline spans are safe on desktop but unsafe on a phone. */
+  [style*="grid-column:span"],
+  [style*="grid-column: 1/-1"],
+  [style*="grid-column:1/-1"] {
+    grid-column: 1 / -1 !important;
+  }
+
+  .card { border-radius: 14px !important; padding: 16px !important; min-width: 0; }
+  .card.tight { padding: 14px !important; }
+  .card-hd { gap: 8px; margin-bottom: 12px; }
+  .card-title { font-size: 13px; }
+  .card-note { font-size: 10.5px; }
+  .card-tag { font-size: 9.5px; }
+
+  .kpi-value { font-size: clamp(28px, 9vw, 36px); }
+  .kpi-spark { width: 40%; }
+
+  .funnel-row,
+  .hbar-row,
+  .rb-row,
+  .risk-row,
+  .outcome,
+  .chat-jrow {
+    grid-template-columns: 1fr !important;
+    gap: 7px !important;
+  }
+  .funnel-bar-bg, .hbar-track, .rb-track, .wd-track, .chat-jbar-track { width: 100%; }
+  .funnel-val, .wd-val { text-align: left; }
+  .chat-jrow { padding: 10px 6px; }
+
+  .wellness-inner { grid-template-columns: 1fr !important; gap: 16px !important; }
+  .wellness-left { border-right: 0 !important; border-bottom: 1px solid var(--line-soft); padding: 0 0 16px !important; }
+  .wd-row { grid-template-columns: minmax(100px, 1fr) 2fr 32px !important; gap: 8px !important; }
+
+  .dp-legend, .opp-grid, .ds-grid, .stress-grid, .exec-grid { grid-template-columns: 1fr !important; }
+  .opp-foot { grid-template-columns: 1fr !important; padding: 16px !important; }
+  .opp-foot-ref { border-left: 0 !important; border-top: 1px solid rgba(255,255,255,.15); padding: 14px 0 0 !important; text-align: left !important; }
+
+  .card-bd { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { max-width: 100%; }
+  table.hist { min-width: 540px; }
+
+  /* SVG charts remain fluid but get a sensible minimum height instead of
+     becoming microscopic inside a one-column card. */
+  .card svg { display: block; max-width: 100%; height: auto; }
+
+  button, .btn, select, input[type="button"], input[type="submit"] {
+    min-height: 44px;
+  }
+  input, select, textarea { font-size: 16px !important; }
+
+  /* Reduce decorative motion / shadow density on small screens. */
+  .card { box-shadow: 0 1px 2px rgba(13,42,71,.04), 0 4px 14px rgba(13,42,71,.05); }
+}
+
+@media (max-width: 380px) {
+  .wrap, .topbar-inner { padding-left: 10px !important; padding-right: 10px !important; }
+  .card { padding: 14px !important; }
+  .kpi-value { font-size: 29px; }
+  .wd-row { grid-template-columns: 1fr 1fr 30px !important; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Touch devices should not depend on hover for essential affordances. */
+@media (hover: none), (pointer: coarse) {
+  .btn, button, select, a.nav-link { -webkit-tap-highlight-color: transparent; }
+  .btn:hover, .nav-link:hover { transform: none !important; }
+}

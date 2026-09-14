@@ -1,0 +1,137 @@
+/* ════════════════════════════════════════════════════════════════════
+   UI ENHANCEMENTS v2 — depth, dimensionality & orchestrated transitions.
+   Additive only, loaded after ui-enhance-v1.css. Uses the same CSS
+   variables already defined on every page (--brand-primary, --blue,
+   --line, --shadow, --shadow-lg, --radius, …).
+
+   Design intent: this is a financial-wellness dashboard trusted with
+   sensitive employee data, not a consumer product — so "3D" here means
+   restrained, physical depth cues (soft tilt, layered shadow, a single
+   light source) rather than decorative spin/bounce. Every effect below
+   answers a person's action (hover, switch, open) rather than looping
+   on its own, and everything is gated behind prefers-reduced-motion and
+   pointer:fine so touch/keyboard users and anyone motion-sensitive get
+   the plain, instant version.
+   ════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: no-preference) {
+
+  /* ── cards: soft physical tilt toward the cursor + a light that tracks it ──
+     Driven by --mx/--my/--rx/--ry, set by ui-enhance-v2.js on pointer move.
+     Falls back to flat if the vars are unset (JS not loaded / touch).
+     perspective() is applied per-card inside `transform`, NOT on a shared
+     ancestor like <body> — putting `perspective` on an ancestor makes that
+     ancestor the containing block for every position:fixed descendant
+     (drawers, modals, backdrops), which pins them to the document instead
+     of the viewport. Keeping it scoped to each card avoids that entirely. */
+  .card {
+    --rx: 0deg; --ry: 0deg; --mx: 50%; --my: 50%;
+    transform-style: preserve-3d;
+    transform: perspective(1000px) rotateX(var(--rx)) rotateY(var(--ry)) translateZ(0);
+    transition: transform .35s cubic-bezier(.2,.7,.2,1), box-shadow .35s ease, border-color .22s ease;
+    isolation: isolate;
+  }
+  .card.tilting { transition: transform .06s linear, box-shadow .12s ease; }
+  .card:hover {
+    box-shadow:
+      0 2px 4px rgba(13,42,71,.06),
+      0 12px 28px rgba(13,42,71,.10),
+      0 32px 64px -12px rgba(50,33,124,.22);
+  }
+  .card::before {
+    content: ""; position: absolute; inset: 0; border-radius: inherit;
+    background: radial-gradient(480px circle at var(--mx) var(--my), rgba(255,255,255,.5), transparent 42%);
+    opacity: 0; transition: opacity .3s ease; pointer-events: none;
+    mix-blend-mode: soft-light; z-index: 1;
+  }
+  .card:hover::before { opacity: 1; }
+
+  /* pull real content above the sheen layer */
+  .card > * { position: relative; z-index: 2; }
+
+  /* KPI/stat numbers sit slightly "raised" off the card on hover — a subtle
+     parallax layer, not a bounce */
+  .kpi-value, .stat-value, .metric-value {
+    display: inline-block;
+    transition: transform .35s cubic-bezier(.2,.7,.2,1);
+  }
+  .card:hover .kpi-value, .card:hover .stat-value, .card:hover .metric-value {
+    transform: translateZ(18px);
+  }
+}
+
+/* touch/imprecise pointers never get the tilt tracking — hover is sticky
+   on touch devices and would leave cards permanently skewed */
+@media (hover: none), (pointer: coarse) {
+  .card { transform: none !important; }
+  .card::before { display: none; }
+}
+
+/* ── a value just changed on screen: a brief, deliberate pop + colour
+   pulse so the eye catches the update. Class is added/removed briefly by
+   ui-enhance-v2.js whenever a KPI's rendered text changes — it never fires
+   on first paint, only on a real value change, so it can't read as fake
+   "loading" motion over static numbers. ── */
+@keyframes ui-value-pop {
+  0%   { transform: scale(1);    color: var(--brand-primary, #32217c); }
+  35%  { transform: scale(1.09); color: var(--blue, #b15be8); }
+  100% { transform: scale(1);    color: inherit; }
+}
+.ui-value-changed { animation: ui-value-pop .5s cubic-bezier(.2,.7,.2,1); }
+
+/* ── audience switch (Employer / Portfolio): a sliding capsule behind the
+   active label instead of an instant background swap ── */
+.audience-switch { position: relative; }
+.audience-switch .switch-pill {
+  position: absolute; top: 3px; bottom: 3px; left: 3px;
+  background: var(--white, #fff); border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(13,42,71,.1), 0 6px 16px rgba(13,42,71,.08);
+  transition: transform .32s cubic-bezier(.2,.7,.2,1), width .32s cubic-bezier(.2,.7,.2,1);
+  pointer-events: none; z-index: 0;
+}
+.audience-switch button { position: relative; z-index: 1; background: transparent !important; }
+.audience-switch button.on { box-shadow: none !important; }
+
+/* ── switching between Employer view and Portfolio view: a soft crossfade
+   + rise instead of an instant display swap. Classes are toggled by
+   wireAudience() in dashboard.html around the existing display change. ── */
+@keyframes ui-view-in { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
+@keyframes ui-view-out { from { opacity: 1; } to { opacity: 0; } }
+#employer-view.view-entering, #portfolio-view.view-entering { animation: ui-view-in .32s cubic-bezier(.2,.7,.2,1) both; }
+#employer-view.view-leaving, #portfolio-view.view-leaving { animation: ui-view-out .12s ease both; }
+
+/* ── modal / drawer entrances get real depth: the schedule report modal
+   tilts up out of the surface instead of just fading; the side drawer
+   keeps its existing slide (untouched) but gains a matching backdrop
+   blur ramp ── */
+@keyframes ui-modal-rise {
+  from { opacity: 0; transform: perspective(1200px) rotateX(6deg) translateY(18px) scale(.97); }
+  to   { opacity: 1; transform: perspective(1200px) rotateX(0) translateY(0) scale(1); }
+}
+.schedule-modal { animation: ui-modal-rise .38s cubic-bezier(.2,.7,.2,1) both; transform-origin: 50% 20%; }
+
+/* ── dropdown menus (account menu, filter dropdowns) get the same
+   perspective pop instead of a flat slide ── */
+.dropdown-menu {
+  transform-origin: 18% -8px;
+}
+.dropdown-menu.open {
+  animation: ui-dropdown-in .22s cubic-bezier(.2,.7,.2,1) both;
+}
+@keyframes ui-dropdown-in {
+  from { opacity: 0; transform: perspective(600px) rotateX(-8deg) translateY(-4px) scale(.98); }
+  to   { opacity: 1; transform: perspective(600px) rotateX(0) translateY(0) scale(1); }
+}
+
+/* ── filter chips / portfolio metric chips: a firmer press-in confirmation
+   on selection rather than an instant colour swap ── */
+@keyframes ui-chip-select { 0% { transform: scale(1); } 40% { transform: scale(.94); } 100% { transform: scale(1); } }
+.pf-chip.on, .dropdown-item.on { animation: ui-chip-select .22s ease both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .kpi-value, .stat-value, .metric-value, .card { transition: none !important; }
+  .ui-value-changed, .schedule-modal, .dropdown-menu.open, .pf-chip.on, .dropdown-item.on,
+  #employer-view.view-entering, #portfolio-view.view-entering,
+  #employer-view.view-leaving, #portfolio-view.view-leaving { animation: none !important; }
+  .audience-switch .switch-pill { transition: none !important; }
+}

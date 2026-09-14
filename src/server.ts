@@ -865,7 +865,7 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     const periods: Array<{ period: string; optimiseScore: number | null }> = [];
     for (const period of orderedPeriods) {
       const snap = snapshotByPeriod.get(period);
-      let score = !hasCohortFilter && snap ? scoreFromSnapshot(snap) : null;
+      let score = (req.query.site == null && req.query.income == null) && snap ? scoreFromSnapshot(snap) : null;
       if (score == null || score === 0) {
         try {
           const live = await getDashboardPayload(employerId, {

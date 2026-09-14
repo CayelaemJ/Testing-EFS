@@ -71,3 +71,4 @@ must(pages.dashboard.includes('Score ${Math.round(Number(score))}') && pages.das
 
 if(failures.length){ console.error('UI regression check failed:\n- '+failures.join('\n- ')); process.exit(1); }
 console.log('UI regression check passed: v0.5.4 navigation, SQL integration, users/import controls, live-data availability and demo-leak safeguards are present.');
+

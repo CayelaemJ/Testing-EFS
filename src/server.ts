@@ -820,69 +820,68 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     // month. With 100k employees that creates a huge N+1 workload before the
     // user has even opened the month selector.
     //
-    // Persisted monthly scores are the fast path. Cohort-specific scores are
-    // calculated only when Region/Income is actually selected, and those calls
-    // are protected by the dashboard cache.
+    // Persisted monthly scores are the fast path. Region/Income is applied by
+    // the dashboard request after a period is selected; the period picker must
+    // never calculate twelve full cohort dashboards.
     const employerId = req.params.employerId;
-    // The picker is deliberately a fixed rolling window: twelve months of
-    // actual employer data, newest first. Do not expose every historical row
-    // and do not calculate the dashboard twelve times just to build a menu.
+    // The period picker is a dimension selector, not a dashboard calculator.
+    // Never rebuild the full dashboard once per month just to populate it.
+
     const snapshots = await prisma.scoreSnapshot.findMany({
       where: { employerId, payloadVersion: { gte: 4 } },
-      select: { period: true, optimiseScore: true, payload: true },
+      select: {
+        period: true,
+        optimiseScore: true,
+        rawScore: true,
+        engagementScore: true,
+        cashflowScore: true,
+        debtRiskScore: true,
+        insuranceScore: true,
+        engagementWeight: true,
+        cashflowWeight: true,
+        debtRiskWeight: true,
+        insuranceWeight: true,
+      },
       orderBy: { period: "desc" },
-      take: 24,
     });
 
+    const periodSet = new Set(snapshots.map((s: any) => s.period));
     const latestEmployee = await prisma.employee.findFirst({
       where: { employerId, sourceDeletedAt: null },
       select: { observedAt: true },
       orderBy: { observedAt: "desc" },
     });
-
-    const periodSet = new Set(snapshots.map((s: any) => s.period));
     if (latestEmployee?.observedAt) periodSet.add(monthKey(latestEmployee.observedAt));
-    const orderedPeriods = [...periodSet].sort().reverse().slice(0, 12);
-    const snapshotByPeriod = new Map(snapshots.map((s: any) => [s.period, s]));
 
-    // If an old snapshot has a bad stored headline score but its payload has
-    // valid driver scores, reconstruct the headline from those drivers. This
-    // prevents the picker from displaying misleading `Score 0` labels after a
-    // score-engine/cache migration. A genuine zero remains zero.
-    const scoreFromSnapshot = (snap: any): number | null => {
-      const stored = Number(snap?.optimiseScore);
-      if (Number.isFinite(stored) && stored > 0) return Math.round(stored);
-      const drivers = snap?.payload?.wellness?.drivers;
-      if (!Array.isArray(drivers) || drivers.length < 4) return Number.isFinite(stored) ? Math.round(stored) : null;
-      const values = drivers.map((d: any) => Number(d?.score));
-      const weights = drivers.map((d: any) => Number(d?.weight));
-      if (values.every(Number.isFinite) && weights.every(Number.isFinite) && weights.reduce((a: number, b: number) => a + b, 0) > 0) {
-        return Math.round(values.reduce((sum: number, value: number, i: number) => sum + value * weights[i], 0));
-      }
-      return Number.isFinite(stored) ? Math.round(stored) : null;
+    // Return at most the latest 12 real reporting months. Keep this query O(12)
+    // and never invoke getDashboardPayload from inside the period-list endpoint.
+    // This is critical on mobile and when Region/Income is already selected.
+    const latestPeriods = [...periodSet].sort().reverse().slice(0, 12);
+    const snapshotByPeriod = new Map(snapshots.map((row: any) => [row.period, row]));
+    const snapshotScore = (snap: any): number | null => {
+      if (!snap) return null;
+      const stored = Number(snap.optimiseScore);
+      // Older/broken snapshots have occasionally contained a zero headline
+      // while the four driver scores were populated. Rebuild the headline
+      // from the persisted driver scores instead of exposing a false 0.
+      const drivers = [
+        [Number(snap.engagementScore), Number(snap.engagementWeight)],
+        [Number(snap.cashflowScore), Number(snap.cashflowWeight)],
+        [Number(snap.debtRiskScore), Number(snap.debtRiskWeight)],
+        [Number(snap.insuranceScore), Number(snap.insuranceWeight)],
+      ];
+      const weighted = drivers.every(([score, weight]) => Number.isFinite(score) && Number.isFinite(weight) && weight > 0)
+        ? Math.round(drivers.reduce((sum, [score, weight]) => sum + score * weight, 0))
+        : null;
+      if (stored > 0 && stored <= 100) return Math.round(stored);
+      if (weighted != null && weighted >= 0 && weighted <= 100) return weighted;
+      const raw = Number(snap.rawScore);
+      return Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : null;
     };
-
-    const periods: Array<{ period: string; optimiseScore: number | null }> = [];
-    for (const period of orderedPeriods) {
-      const snap = snapshotByPeriod.get(period);
-      let score = (req.query.site == null && req.query.income == null) && snap ? scoreFromSnapshot(snap) : null;
-      if (score == null || score === 0) {
-        try {
-          const live = await getDashboardPayload(employerId, {
-            period,
-            site: req.query.site,
-            income: req.query.income,
-          });
-          if (live?.wellness?.complete && live?.wellness?.score != null) score = Number(live.wellness.score);
-        } catch {
-          // Keep the period visible even if a historical score cannot be
-          // calculated; never turn a valid month into a missing menu item.
-        }
-      }
-      periods.push({ period, optimiseScore: Number.isFinite(Number(score)) ? Math.round(Number(score)) : null });
-    }
-
-    return periods;
+    return latestPeriods.map(period => {
+      const snap: any = snapshotByPeriod.get(period);
+      return { period, optimiseScore: snapshotScore(snap) };
+    });
   },
 );
 

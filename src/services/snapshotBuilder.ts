@@ -146,7 +146,7 @@ function endOfMonth(period: string): Date {
   const [year, month] = period.split("-").map(Number);
   return new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
 }
-function monthKey(date: Date): string {
+export function monthKey(date: Date): string {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 function monthLabel(key: string): string {

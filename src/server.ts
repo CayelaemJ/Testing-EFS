@@ -815,53 +815,67 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     const user = await requireUser(req, reply); if (!user) return;
     if (!canViewEmployer(user, req.params.employerId)) return reply.code(403).send({ error: "no access" });
 
-    // Keep this endpoint cheap. The previous implementation read date columns
-    // from six large tables and then ran the full dashboard builder once per
-    // month. With 100k employees that creates a huge N+1 workload before the
-    // user has even opened the month selector.
-    //
-    // Persisted monthly scores are the fast path. Cohort-specific scores are
-    // calculated only when Region/Income is actually selected, and those calls
-    // are protected by the dashboard cache.
+    // The period picker is a dimension, not a dashboard calculation endpoint.
+    // It must expose the actual months for which source/snapshot data exists
+    // without running the full dashboard once per month. The old implementation
+    // did exactly that when a cohort filter was selected, turning a 12-month
+    // dropdown into up to 12 expensive dashboard builds.
     const employerId = req.params.employerId;
-    const hasCohortFilter = Boolean(req.query.site && req.query.site !== "all") || Boolean(req.query.income && req.query.income !== "all");
 
-    const snapshots = await prisma.scoreSnapshot.findMany({
-      where: { employerId, payloadVersion: { gte: 4 } },
-      select: { period: true, optimiseScore: true },
-      orderBy: { period: "desc" },
-    });
+    const [monthRows, snapshots] = await Promise.all([
+      prisma.$queryRaw<Array<{ period: string }>>`
+        SELECT period
+        FROM (
+          SELECT TO_CHAR(DATE_TRUNC('month', "observedAt"), 'YYYY-MM') AS period
+          FROM "EmployeeVersion"
+          WHERE "employeeId" IN (
+            SELECT id FROM "Employee"
+            WHERE "employerId" = ${employerId}
+          )
+            AND "isDeleted" = false
 
-    const periodSet = new Set(snapshots.map((s: any) => s.period));
-    const latestEmployee = await prisma.employee.findFirst({
-      where: { employerId, sourceDeletedAt: null },
-      select: { observedAt: true },
-      orderBy: { observedAt: "desc" },
-    });
-    if (latestEmployee?.observedAt) periodSet.add(monthKey(latestEmployee.observedAt));
+          UNION
 
-    const periods: Array<{ period: string; optimiseScore: number | null }> = [];
-    for (const period of [...periodSet].sort().reverse()) {
-      const snap = snapshots.find((row: any) => row.period === period);
-      if (!hasCohortFilter && snap) {
-        periods.push({ period, optimiseScore: snap.optimiseScore == null ? null : Number(snap.optimiseScore) });
-        continue;
-      }
-      try {
-        const live = await getDashboardPayload(employerId, {
-          period,
-          site: req.query.site,
-          income: req.query.income,
-        });
-        periods.push({
-          period,
-          optimiseScore: live?.wellness?.complete && live?.wellness?.score != null ? Number(live.wellness.score) : null,
-        });
-      } catch {
-        periods.push({ period, optimiseScore: null });
-      }
-    }
-    return periods;
+          SELECT TO_CHAR(DATE_TRUNC('month', "observedAt"), 'YYYY-MM') AS period
+          FROM "Employee"
+          WHERE "employerId" = ${employerId}
+            AND "sourceDeletedAt" IS NULL
+
+          UNION
+
+          SELECT "period"
+          FROM "ScoreSnapshot"
+          WHERE "employerId" = ${employerId}
+            AND "payloadVersion" >= 4
+        ) months
+        WHERE period IS NOT NULL
+        ORDER BY period DESC
+        LIMIT 12
+      `,
+      prisma.scoreSnapshot.findMany({
+        where: { employerId, payloadVersion: { gte: 4 } },
+        select: { period: true, optimiseScore: true },
+        orderBy: { period: "desc" },
+        take: 12,
+      }),
+    ]);
+
+    const scoreByPeriod = new Map(
+      snapshots.map((row: any) => [
+        row.period,
+        row.optimiseScore == null ? null : Number(row.optimiseScore),
+      ]),
+    );
+
+    // Always return the twelve latest data-bearing months (or fewer only when
+    // the source genuinely contains fewer than twelve months). Do not calculate
+    // cohort scores here: Region/Income selection must not turn the dimension
+    // endpoint into 12 full dashboard requests. The selected dashboard period
+    // remains responsible for its cohort-specific score.
+    return monthRows.map(({ period }) => ({
+      period,
+      optimiseScore: scoreByPeriod.get(period) ?? null,
+    }));
   },
 );
 

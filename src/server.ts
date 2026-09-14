@@ -815,67 +815,74 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     const user = await requireUser(req, reply); if (!user) return;
     if (!canViewEmployer(user, req.params.employerId)) return reply.code(403).send({ error: "no access" });
 
-    // The period picker is a dimension, not a dashboard calculation endpoint.
-    // It must expose the actual months for which source/snapshot data exists
-    // without running the full dashboard once per month. The old implementation
-    // did exactly that when a cohort filter was selected, turning a 12-month
-    // dropdown into up to 12 expensive dashboard builds.
+    // Keep this endpoint cheap. The previous implementation read date columns
+    // from six large tables and then ran the full dashboard builder once per
+    // month. With 100k employees that creates a huge N+1 workload before the
+    // user has even opened the month selector.
+    //
+    // Persisted monthly scores are the fast path. Cohort-specific scores are
+    // calculated only when Region/Income is actually selected, and those calls
+    // are protected by the dashboard cache.
     const employerId = req.params.employerId;
+    // The picker is deliberately a fixed rolling window: twelve months of
+    // actual employer data, newest first. Do not expose every historical row
+    // and do not calculate the dashboard twelve times just to build a menu.
+    const snapshots = await prisma.scoreSnapshot.findMany({
+      where: { employerId, payloadVersion: { gte: 4 } },
+      select: { period: true, optimiseScore: true, payload: true },
+      orderBy: { period: "desc" },
+      take: 24,
+    });
 
-    const [monthRows, snapshots] = await Promise.all([
-      prisma.$queryRaw<Array<{ period: string }>>`
-        SELECT period
-        FROM (
-          SELECT TO_CHAR(DATE_TRUNC('month', "observedAt"), 'YYYY-MM') AS period
-          FROM "EmployeeVersion"
-          WHERE "employeeId" IN (
-            SELECT id FROM "Employee"
-            WHERE "employerId" = ${employerId}
-          )
-            AND "isDeleted" = false
+    const latestEmployee = await prisma.employee.findFirst({
+      where: { employerId, sourceDeletedAt: null },
+      select: { observedAt: true },
+      orderBy: { observedAt: "desc" },
+    });
 
-          UNION
+    const periodSet = new Set(snapshots.map((s: any) => s.period));
+    if (latestEmployee?.observedAt) periodSet.add(monthKey(latestEmployee.observedAt));
+    const orderedPeriods = [...periodSet].sort().reverse().slice(0, 12);
+    const snapshotByPeriod = new Map(snapshots.map((s: any) => [s.period, s]));
 
-          SELECT TO_CHAR(DATE_TRUNC('month', "observedAt"), 'YYYY-MM') AS period
-          FROM "Employee"
-          WHERE "employerId" = ${employerId}
-            AND "sourceDeletedAt" IS NULL
+    // If an old snapshot has a bad stored headline score but its payload has
+    // valid driver scores, reconstruct the headline from those drivers. This
+    // prevents the picker from displaying misleading `Score 0` labels after a
+    // score-engine/cache migration. A genuine zero remains zero.
+    const scoreFromSnapshot = (snap: any): number | null => {
+      const stored = Number(snap?.optimiseScore);
+      if (Number.isFinite(stored) && stored > 0) return Math.round(stored);
+      const drivers = snap?.payload?.wellness?.drivers;
+      if (!Array.isArray(drivers) || drivers.length < 4) return Number.isFinite(stored) ? Math.round(stored) : null;
+      const values = drivers.map((d: any) => Number(d?.score));
+      const weights = drivers.map((d: any) => Number(d?.weight));
+      if (values.every(Number.isFinite) && weights.every(Number.isFinite) && weights.reduce((a: number, b: number) => a + b, 0) > 0) {
+        return Math.round(values.reduce((sum: number, value: number, i: number) => sum + value * weights[i], 0));
+      }
+      return Number.isFinite(stored) ? Math.round(stored) : null;
+    };
 
-          UNION
+    const periods: Array<{ period: string; optimiseScore: number | null }> = [];
+    for (const period of orderedPeriods) {
+      const snap = snapshotByPeriod.get(period);
+      let score = !hasCohortFilter && snap ? scoreFromSnapshot(snap) : null;
+      if (score == null || score === 0) {
+        try {
+          const live = await getDashboardPayload(employerId, {
+            period,
+            site: req.query.site,
+            income: req.query.income,
+          });
+          if (live?.wellness?.complete && live?.wellness?.score != null) score = Number(live.wellness.score);
+        } catch {
+          // Keep the period visible even if a historical score cannot be
+          // calculated; never turn a valid month into a missing menu item.
+        }
+      }
+      periods.push({ period, optimiseScore: Number.isFinite(Number(score)) ? Math.round(Number(score)) : null });
+    }
 
-          SELECT "period"
-          FROM "ScoreSnapshot"
-          WHERE "employerId" = ${employerId}
-            AND "payloadVersion" >= 4
-        ) months
-        WHERE period IS NOT NULL
-        ORDER BY period DESC
-        LIMIT 12
-      `,
-      prisma.scoreSnapshot.findMany({
-        where: { employerId, payloadVersion: { gte: 4 } },
-        select: { period: true, optimiseScore: true },
-        orderBy: { period: "desc" },
-        take: 12,
-      }),
-    ]);
-
-    const scoreByPeriod = new Map(
-      snapshots.map((row: any) => [
-        row.period,
-        row.optimiseScore == null ? null : Number(row.optimiseScore),
-      ]),
-    );
-
-    // Always return the twelve latest data-bearing months (or fewer only when
-    // the source genuinely contains fewer than twelve months). Do not calculate
-    // cohort scores here: Region/Income selection must not turn the dimension
-    // endpoint into 12 full dashboard requests. The selected dashboard period
-    // remains responsible for its cohort-specific score.
-    return monthRows.map(({ period }) => ({
-      period,
-      optimiseScore: scoreByPeriod.get(period) ?? null,
-    }));
+    return periods;
   },
 );
 

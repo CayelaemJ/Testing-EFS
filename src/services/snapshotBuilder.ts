@@ -15,30 +15,11 @@ const prisma = new PrismaClient();
 // Short-lived server-side cache: dashboard reads are read-heavy and the same
 // cohort is commonly requested repeatedly while users move between tabs.
 // Keep this deliberately small so slicer changes remain effectively real-time.
-const DASHBOARD_CACHE_TTL_MS = 15_000;
-// Bump whenever the dashboard payload semantics change so stale persistent
-// cohort payloads cannot survive a deployment and feed the UI old scores.
-const DASHBOARD_CACHE_SCHEMA = "v6";
+const DASHBOARD_CACHE_TTL_MS = 60_000;
 const dashboardCache = new Map<string, { expiresAt: number; payload: any }>();
 
-function repairSnapshotPayloadScore(payload: any): any {
-  if (!payload?.wellness || !Array.isArray(payload.wellness.drivers) || payload.wellness.drivers.length < 4) return payload;
-  const drivers = payload.wellness.drivers;
-  const values = drivers.map((d: any) => Number(d?.score));
-  const weights = drivers.map((d: any) => Number(d?.weight));
-  const weighted = values.reduce((sum: number, value: number, i: number) => sum + (Number.isFinite(value) && Number.isFinite(weights[i]) ? value * weights[i] : 0), 0);
-  const weightTotal = weights.reduce((sum: number, value: number) => sum + (Number.isFinite(value) ? value : 0), 0);
-  if (weightTotal > 0 && values.every(Number.isFinite)) {
-    const score = Math.round(weighted / weightTotal);
-    if (!Number.isFinite(Number(payload.wellness.score)) || Number(payload.wellness.score) === 0 && score > 0) {
-      return { ...payload, wellness: { ...payload.wellness, score, band: wellnessBand(score) } };
-    }
-  }
-  return payload;
-}
-
 function dashboardCacheKey(employerId: string, query: DashboardQuery): string {
-  return JSON.stringify([DASHBOARD_CACHE_SCHEMA, employerId, query.period ?? null, query.quarter ?? null, query.range ?? null, query.site ?? null, query.income ?? null, query.asAt ?? null]);
+  return JSON.stringify([employerId, query.period ?? null, query.quarter ?? null, query.range ?? null, query.site ?? null, query.income ?? null, query.asAt ?? null]);
 }
 
 const DAY_MS = 86_400_000;
@@ -1376,20 +1357,18 @@ async function persistDashboardCache(employerId: string, query: DashboardQuery, 
 }
 
 export async function getDashboardPayload(employerId: string, query: DashboardQuery = {}) {
-  // Resolve Latest before looking in either cache. Previously the cache key was
-  // built from range=latest, while snapshot warming stored the resolved
-  // YYYY-MM payload. That made the first dashboard load bypass the warm cache
-  // and rebuild the full 100k-row dashboard on every device.
-  let effectiveQuery: DashboardQuery = query;
-  if (query.range === "latest" && !query.period) {
-    const latestSnap = await prisma.scoreSnapshot.findFirst({
+  // Resolve "latest" to the newest persisted monthly snapshot before cache
+  // lookup. This makes the default landing page use the same fast read-model
+  // path as an explicit month instead of rebuilding 100k-row source data.
+  if (!query.period && !query.quarter && query.range === "latest") {
+    const latest = await prisma.scoreSnapshot.findFirst({
       where: { employerId, payloadVersion: { gte: 4 } },
       orderBy: { period: "desc" },
       select: { period: true },
     });
-    effectiveQuery = { ...query, range: undefined, period: latestSnap?.period ?? currentPeriod() };
+    if (latest?.period) query = { ...query, period: latest.period, range: undefined };
   }
-  const key = dashboardCacheKey(employerId, effectiveQuery);
+  const key = dashboardCacheKey(employerId, query);
   const hit = dashboardCache.get(key);
   const now = Date.now();
   if (hit && hit.expiresAt > now) return hit.payload;
@@ -1398,42 +1377,20 @@ export async function getDashboardPayload(employerId: string, query: DashboardQu
   // persistent read model before touching Employee/Journey/Debt/Policy rows.
   // This is what turns a 100k-row dashboard interaction into a tiny indexed
   // PostgreSQL lookup.
-  if (effectiveQuery.period && effectiveQuery.range == null) {
-    const persisted = await readPersistentDashboardCache(employerId, effectiveQuery);
+  if (query.period && query.range == null) {
+    const persisted = await readPersistentDashboardCache(employerId, query);
     if (persisted) {
-      const repaired = repairSnapshotPayloadScore(persisted);
-      // A cached zero is only safe when the payload's four drivers also
-      // genuinely resolve to zero. If the cache is stale/corrupt, rebuild the
-      // selected period once rather than showing a misleading `Score 0`.
-      if (Number(repaired?.wellness?.score) !== 0) {
-        dashboardCache.set(key, { expiresAt: now + DASHBOARD_CACHE_TTL_MS, payload: repaired });
-        return repaired;
-      }
-    }
-    // ScoreSnapshot already stores the complete dashboard payload for the
-    // employer/month. Use it as the zero-computation fallback for the common
-    // all-region/all-income view instead of rebuilding the raw joins.
-    if (!effectiveQuery.site && !effectiveQuery.income) {
-      const snapshot = await prisma.scoreSnapshot.findFirst({
-        where: { employerId, period: effectiveQuery.period, payloadVersion: { gte: 4 } },
-        select: { payload: true },
-      });
-      if (snapshot?.payload) {
-        const repaired = repairSnapshotPayloadScore(snapshot.payload);
-        if (Number(repaired?.wellness?.score) !== 0) {
-          dashboardCache.set(key, { expiresAt: now + DASHBOARD_CACHE_TTL_MS, payload: repaired });
-          return repaired;
-        }
-      }
+      dashboardCache.set(key, { expiresAt: now + DASHBOARD_CACHE_TTL_MS, payload: persisted });
+      return persisted;
     }
   }
 
-  const payload = await buildDashboardPayload(employerId, effectiveQuery);
+  const payload = await buildDashboardPayload(employerId, query);
   dashboardCache.set(key, { expiresAt: now + DASHBOARD_CACHE_TTL_MS, payload });
   // Persist every explicit period/cohort result. A cold cohort pays the
   // calculation cost once; every subsequent user sees the read-model path.
-  if (effectiveQuery.period && effectiveQuery.range == null) {
-    try { await persistDashboardCache(employerId, effectiveQuery, payload); } catch { /* cache failure must never break dashboard */ }
+  if (query.period && query.range == null) {
+    try { await persistDashboardCache(employerId, query, payload); } catch { /* cache failure must never break dashboard */ }
   }
   if (dashboardCache.size > 250) {
     for (const [k, v] of dashboardCache) if (v.expiresAt <= now) dashboardCache.delete(k);

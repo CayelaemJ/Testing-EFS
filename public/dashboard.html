@@ -1829,21 +1829,7 @@ document.getElementById('footnote').innerHTML =
 /* keep a pristine copy so filters can re-derive from source */
 let BASE = JSON.parse(JSON.stringify(DATA));
 let LIVE_REQUEST_SEQ = 0;
-let LIVE_ABORT_CONTROLLER = null;
-const LIVE_DATA_CACHE = new Map();
-const LIVE_DATA_CACHE_TTL = 60_000;
-function readLiveDataCache(url){
-  const hit=LIVE_DATA_CACHE.get(url);
-  if(!hit || hit.expiresAt<Date.now()){ if(hit) LIVE_DATA_CACHE.delete(url); return null; }
-  return hit.data;
-}
-function writeLiveDataCache(url,data){
-  LIVE_DATA_CACHE.set(url,{expiresAt:Date.now()+LIVE_DATA_CACHE_TTL,data});
-  if(LIVE_DATA_CACHE.size>40){
-    const oldest=[...LIVE_DATA_CACHE.entries()].sort((a,b)=>a[1].expiresAt-b[1].expiresAt)[0];
-    if(oldest) LIVE_DATA_CACHE.delete(oldest[0]);
-  }
-}
+let LIVE_ABORT = null;
 
 /* view state */
 const STATE = {
@@ -1882,29 +1868,23 @@ function randMoney(v,f){ // scale a "R 2.41m"/"R 222k" style string
 
 /* rebuild DATA from BASE according to STATE, then re-render everything */
 function applyState(){
-  // When real data is loaded from the API, render it directly. The period /
-  // region scaling below is demo-only machinery (it multiplies figures by
-  // illustrative ratios); applying it to real snapshots would distort them.
   if (window.__LIVE__) {
     clearAll();
-    // Paint the decision-critical cards first so mobile users see useful data
-    // immediately instead of waiting for every analytical table/chart to be
-    // rebuilt. The heavier secondary sections yield to the browser for a frame.
-    renderExec(); renderWellness(); renderKPIs(); renderFunnel(); renderValueStrip();
-    wireMetricTips(document.getElementById('employer-view'));
+    // Paint the score/KPI layer first; yield before heavy charts and tables.
+    renderExec(); renderWellness(); renderKPIs(); renderFunnel(); renderOutcomes(); renderValueStrip();
     updateContextLine();
-    requestAnimationFrame(()=>{
-      if(!window.__LIVE__) return;
-      renderOutcomes(); renderSavings(); renderEwa(); renderDebtProfile(); renderCreditors(); renderRegions(); renderIncome();
-      renderRatings(); renderDebtStates(); renderPrescription(); renderRiskSignals(); renderOpportunities(); renderChat(); renderStressMap();
-      wireMetricTips(document.getElementById('employer-view'));
-    });
     const ep0=document.getElementById('exec-period');
     if(ep0) ep0.textContent=((DATA.filterContext&&DATA.filterContext.label)||'Latest')+' · at a glance';
     const siteLabel=document.querySelector('#region-filter .tag-label');
     const incomeLabel=document.querySelector('#income-filter .tag-label');
     if(siteLabel) siteLabel.textContent=DATA.filterContext?.site || (STATE.region==='all'?'All regions':STATE.region);
     if(incomeLabel) incomeLabel.textContent=DATA.filterContext?.incomeLabel || (STATE.income==='all'?'All income bands':STATE.income);
+    requestAnimationFrame(()=>{
+      renderSavings(); renderEwa(); renderDebtProfile(); renderCreditors(); renderRegions(); renderIncome();
+      renderRatings(); renderDebtStates(); renderPrescription(); renderRiskSignals(); renderOpportunities(); renderChat();
+      renderStressMap();
+      wireMetricTips(document.getElementById('employer-view'));
+    });
     return;
   }
   const p=PERIOD[STATE.period], f=p.f;
@@ -2532,8 +2512,6 @@ function apiFilterQuery(){
   return q?'?'+q:'';
 }
 function switchFilter(name,value,opts={}){
-  const current=new URLSearchParams(location.search).get(name);
-  if((value||'')===(current||'') && !opts.clearPeriod) return;
   const params=new URLSearchParams(location.search);
   if(value && value!=='all') params.set(name,value); else if(name==='range') params.set(name,'all'); else params.delete(name);
   if(opts.clearPeriod) { params.delete('period'); params.delete('quarter'); }
@@ -2545,67 +2523,106 @@ function switchFilter(name,value,opts={}){
 
 async function loadLiveData({refreshOnly=false}={}){
   const requestSeq=++LIVE_REQUEST_SEQ;
-  if(LIVE_ABORT_CONTROLLER) LIVE_ABORT_CONTROLLER.abort();
-  LIVE_ABORT_CONTROLLER=new AbortController();
-  const signal=LIVE_ABORT_CONTROLLER.signal;
+  if(LIVE_ABORT) LIVE_ABORT.abort();
+  LIVE_ABORT = new AbortController();
+  const requestSignal = LIVE_ABORT.signal;
+  // require sign-in
   let me=window.__ME__||null;
   const view=document.getElementById('employer-view');
   if(refreshOnly && view){ view.setAttribute('aria-busy','true'); view.classList.add('is-refreshing'); }
   if(!refreshOnly){
-    try{ const r=await fetch('/api/auth/me',{signal}); if(!r.ok){ location.href='/login'; return; } me=await r.json(); }
-    catch(e){ if(e?.name==='AbortError') return; location.href='/login'; return; }
-    window.__ME__=me; addAuthBar(me); applyTheme(me.theme); handleWelcomeSplash(me); applySectionVisibility(me); populateEmployerSelect(me);
+    try{ const r=await fetch('/api/auth/me'); if(!r.ok){ location.href='/login'; return; } me=await r.json(); }
+    catch(e){ location.href='/login'; return; }
+    window.__ME__=me;
+    addAuthBar(me);
+    applyTheme(me.theme);
+    handleWelcomeSplash(me);
+    applySectionVisibility(me);
+    populateEmployerSelect(me);
   }
+
   try{
-    let id=employerIdFromUrl();
-    if(!id && me.employers && me.employers.length) id=me.employers[0].id;
+    let id = employerIdFromUrl();
+    if(!id && me.employers && me.employers.length){ id = me.employers[0].id; }
     const employerSelect=document.getElementById('employer-select');
     if(employerSelect && id) employerSelect.value=id;
     syncStateFromUrl();
-    const period=periodFromUrl(), quarter=quarterFromUrl();
-    const periodsPromise=id ? populateMonthSelect(id,period,quarter,signal) : Promise.resolve();
-    const qs=apiFilterQuery();
-    const url=id ? `${API_BASE}/api/employers/${id}/dashboard${qs}` : `${API_BASE}/api/dashboard/first${qs}`;
-    const cached=readLiveDataCache(url);
-    let live;
-    if(cached) live=cached;
-    else{
-      const r=await fetch(url,{cache:'no-store',signal});
-      if(!r.ok) throw new Error((await r.json().catch(()=>({}))).error||'no data');
-      live=await r.json(); writeLiveDataCache(url,live);
-    }
+    const period = periodFromUrl();
+    const quarter = quarterFromUrl();
+    const qs = apiFilterQuery();
+    const url = id ? `${API_BASE}/api/employers/${id}/dashboard${qs}` : `${API_BASE}/api/dashboard/first${qs}`;
+    // Period options and dashboard data are independent. Fetch them together
+    // so the first paint is not blocked by a second round-trip.
+    const periodPromise = id ? populateMonthSelect(id, period, quarter) : Promise.resolve();
+    const livePromise = fetch(url, { cache: 'no-store', signal: requestSignal }).then(async r=>{ if(!r.ok) throw new Error((await r.json().catch(()=>({}))).error||'no data'); return r.json(); });
+    const [_, live] = await Promise.all([periodPromise, livePromise]);
     if(requestSeq!==LIVE_REQUEST_SEQ) return;
-    DATA=live; BASE=JSON.parse(JSON.stringify(DATA)); window.__LIVE__=true;
-    if(live.employer){ const h1=document.querySelector('.head h1'); if(h1) h1.firstChild.textContent=live.employer+' '; }
-    const fl=document.getElementById('data-fresh-label'); document.querySelector('.data-fresh')?.classList.remove('is-error');
-    if(fl){ if(live.sourceDataUpdatedAt||live.dataAsOf){ const d=new Date(live.sourceDataUpdatedAt||live.dataAsOf); fl.textContent='Source updated '+d.toLocaleDateString('en-ZA',{day:'numeric',month:'short',year:'numeric'}); } else fl.textContent='Live data'; }
-    renderMonthActivity(live.monthActivity,live.filterContext); renderDataQuality(live.dataQuality); setLiveFootnote(live.filterContext);
-    const banner=document.getElementById('demo-banner'); if(banner) banner.remove();
-    applyState(); updatePeriodControlTone(); syncPeriodControl(); wireFilters();
-    if(!refreshOnly){ wireAudience(); wireHeaderBtns(); }
-    if(refreshOnly && view){ view.removeAttribute('aria-busy'); view.classList.remove('is-refreshing'); }
-    await periodsPromise.catch(()=>{});
-    if(me.modules?.portfolio && requestSeq===LIVE_REQUEST_SEQ){
-      queueMicrotask(async()=>{
-        try{
-          const pfParams=new URLSearchParams(), pageParams=new URLSearchParams(location.search);
-          ['period','quarter','range'].forEach(k=>{ const v=pageParams.get(k); if(v) pfParams.set(k,v); });
-          if(!pfParams.has('period')&&!pfParams.has('quarter')&&!pfParams.has('range')) pfParams.set('range','latest');
-          const pfUrl=`${API_BASE}/api/portfolio?${pfParams.toString()}`;
-          const pfCached=readLiveDataCache(pfUrl);
-          const pf=pfCached||await fetch(pfUrl,{cache:'no-store'}).then(async r=>{ if(!r.ok) throw new Error('portfolio unavailable'); return r.json(); });
-          if(!pfCached) writeLiveDataCache(pfUrl,pf);
-          if(requestSeq!==LIVE_REQUEST_SEQ) return;
-          if(Array.isArray(pf.employers)){ PORTFOLIO.employers=pf.employers; PORTFOLIO.filterContext=pf.filterContext||null; PORTFOLIO.live=true; PF_SELECTION_INITIALIZED=false; PF_SELECTED_IDS.clear(); PF_RENDERED=false; }
-        }catch(_){ PORTFOLIO.live=false; PORTFOLIO.error=true; if(!PORTFOLIO.explicitDemo) PORTFOLIO.employers=[]; PF_RENDERED=false; }
-      });
+    if(me.modules?.portfolio){
+      // Portfolio is secondary content; do not hold the employer dashboard's
+      // first paint hostage to a potentially expensive portfolio query.
+      const pfParams=new URLSearchParams();
+      void (async()=>{
+      try{
+        const pageParams=new URLSearchParams(location.search);
+        ['period','quarter','range'].forEach(k=>{ const v=pageParams.get(k); if(v) pfParams.set(k,v); });
+        if(!pfParams.has('period') && !pfParams.has('quarter') && !pfParams.has('range')) pfParams.set('range','latest');
+        const pf=await fetch(`${API_BASE}/api/portfolio?${pfParams.toString()}`, {signal: requestSignal, cache:'no-store'}).then(async r=>{ if(!r.ok) throw new Error('portfolio unavailable'); return r.json(); });
+        if(Array.isArray(pf.employers)){
+          PORTFOLIO.employers=pf.employers;
+          PORTFOLIO.filterContext=pf.filterContext||null;
+          PORTFOLIO.live=true;
+          PF_SELECTION_INITIALIZED=false;
+          PF_SELECTED_IDS.clear();
+          PF_RENDERED=false;
+        }
+      }catch(e){
+        if(e?.name==='AbortError') return;
+        PORTFOLIO.live=false;
+        PORTFOLIO.error=true;
+        if(!PORTFOLIO.explicitDemo) PORTFOLIO.employers=[];
+        PF_RENDERED=false;
+      }
+      })();
     }
+    DATA = live;
+    BASE = JSON.parse(JSON.stringify(DATA));
+    window.__LIVE__ = true;
+    if(live.employer){
+      const h1=document.querySelector('.head h1'); if(h1) h1.firstChild.textContent = live.employer + ' ';
+    }
+    // real data-freshness from the last import/recompute
+    const fl=document.getElementById('data-fresh-label');
+    document.querySelector('.data-fresh')?.classList.remove('is-error');
+    if(fl){
+      if(live.sourceDataUpdatedAt||live.dataAsOf){
+        const d=new Date(live.sourceDataUpdatedAt||live.dataAsOf);
+        fl.textContent='Source updated '+d.toLocaleDateString('en-ZA',{day:'numeric',month:'short',year:'numeric'});
+      } else { fl.textContent='Live data'; }
+    }
+    renderMonthActivity(live.monthActivity, live.filterContext);
+    renderDataQuality(live.dataQuality);
+    setLiveFootnote(live.filterContext);
+    const banner = document.getElementById('demo-banner'); if(banner) banner.remove();
   }catch(e){
-    if(e?.name==='AbortError') return;
     const demoMode=new URLSearchParams(location.search).get('demo')==='1';
-    if(demoMode){ showDemoBanner(); const fl=document.getElementById('data-fresh-label'); if(fl) fl.textContent='Demo data'; }
-    else{ showLiveError(e); wireAudience(); wireHeaderBtns(); return; }
+    if(demoMode){
+      showDemoBanner();
+      const fl=document.getElementById('data-fresh-label'); if(fl) fl.textContent='Demo data';
+    }else{
+      showLiveError(e);
+      wireAudience(); wireHeaderBtns();
+      return;
+    }
   }
+  applyState();
+  updatePeriodControlTone();
+  // Rewire the filter menus on every live refresh so employer changes and
+  // URL-driven filter changes always rebuild the choices from the new payload.
+  syncPeriodControl(); wireFilters();
+  if(!refreshOnly){
+    wireAudience(); wireHeaderBtns();
+  }
+  if(refreshOnly && view){ view.removeAttribute('aria-busy'); view.classList.remove('is-refreshing'); }
 }
 
 // month picker — populated from the snapshots that actually exist
@@ -2635,7 +2652,7 @@ function updatePeriodControlTone(){
   sel.style.backgroundColor=tone?.bg||'';
 }
 
-async function populateMonthSelect(employerId, selected, selectedQuarter, signal){
+async function populateMonthSelect(employerId, selected, selectedQuarter){
   const sel=document.getElementById('month-select'); if(!sel) return;
   sel.querySelectorAll('optgroup').forEach(g=>g.remove());
   try{
@@ -2644,7 +2661,7 @@ async function populateMonthSelect(employerId, selected, selectedQuarter, signal
     if(page.get('site')) qs.set('site',page.get('site'));
     if(page.get('income')) qs.set('income',page.get('income'));
     const suffix=qs.toString()?`?${qs.toString()}`:'';
-    const periods=await fetch(`${API_BASE}/api/employers/${employerId}/periods${suffix}`, { cache: 'no-store', signal }).then(r=>r.json());
+    const periods=await fetch(`${API_BASE}/api/employers/${employerId}/periods${suffix}`, { cache: 'no-store', signal: LIVE_ABORT?.signal }).then(r=>r.json());
     if(!Array.isArray(periods) || periods.length<1){
       updatePeriodControlTone();
       return;
@@ -2658,16 +2675,19 @@ async function populateMonthSelect(employerId, selected, selectedQuarter, signal
     periods.forEach(p=>{
       const [y,m]=p.period.split('-').map(Number);
       const q=Math.floor((m-1)/3)+1, key=`${y}-Q${q}`;
-      const bucket=quarters.get(key);
-      // Quarter score is the score at the quarter close (the last available
-      // month), not an average that can hide the actual closing score.
-      if(!bucket || p.period>bucket.period) quarters.set(key,{label:`Q${q} ${y}`,period:p.period,score:p.optimiseScore});
+      const bucket=quarters.get(key)||{label:`Q${q} ${y}`,year:y,q,latestPeriod:p.period};
+      if(p.period>bucket.latestPeriod) bucket.latestPeriod=p.period;
+      quarters.set(key,bucket);
     });
     const quarterKeys=[...quarters.keys()].sort().reverse();
     let extra='';
     if(quarterKeys.length){
       extra+=`<optgroup label="Quarters">`+quarterKeys.map(key=>{
-        const q=quarters.get(key), score=Number.isFinite(Number(q.score))?Math.round(Number(q.score)):null;
+        const q=quarters.get(key);
+        const closePeriod=`${q.year}-${String(q.q*3).padStart(2,'0')}`;
+        const close=periods.find(p=>p.period===closePeriod);
+        const fallback=periods.find(p=>p.period===q.latestPeriod);
+        const score=Number.isFinite(Number(close?.optimiseScore)) ? Math.round(Number(close.optimiseScore)) : (Number.isFinite(Number(fallback?.optimiseScore)) ? Math.round(Number(fallback.optimiseScore)) : null);
         return `<option value="q:${key}" data-score="${score??''}" ${key===selectedQuarter?'selected':''}>${q.label}${scoreText(score).replace(" · Score ",": Score ")}</option>`;
       }).join('')+`</optgroup>`;
     }

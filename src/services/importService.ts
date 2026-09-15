@@ -246,26 +246,9 @@ async function commitRowsChunk(
 
         }
 
-        // Keep the Employer cache aligned with the newest non-retracted snapshot.
-        // A tombstone for the latest month must fall back to the preceding valid
-        // month rather than caching the deleted value as the current denominator.
-        const employerRefs = [...new Set(rows.map((row) => String(row.employer_ref)))];
-        for (const employerRef of employerRefs) {
-          const latest = await tx.employerHeadcountSnapshot.findFirst({
-            where: { employerId: employerRef, sourceDeletedAt: null },
-            orderBy: [{ asOfDate: "desc" }, { sourceUpdatedAt: "desc" }],
-          });
-          const employer = await tx.employer.findUnique({ where: { id: employerRef } });
-          if (employer) {
-            await tx.employer.update({
-              where: { id: employerRef },
-              data: {
-                eligibleCount: latest?.eligibleCount ?? 0,
-                eligibleCountAsAt: latest?.asOfDate ?? null,
-              },
-            });
-          }
-        }
+        // Employer's current headcount cache is refreshed once after the full
+        // batch finishes (not once per 1k/2k-row chunk). This avoids a large
+        // amount of repeated findFirst + update traffic during big imports.
         break;
       }
 
@@ -277,7 +260,16 @@ async function commitRowsChunk(
         for (const site of siteKeys.values()) {
           await tx.site.upsert({ where: { employerId_name: site }, create: site, update: {} });
         }
-        const sites = await tx.site.findMany({ select: { id: true, employerId: true, name: true } });
+        const siteKeyList = [...siteKeys.keys()];
+        const sites = siteKeyList.length
+          ? await tx.site.findMany({
+              where: { OR: siteKeyList.map((key) => {
+                const split = key.indexOf("|");
+                return { employerId: key.slice(0, split), name: key.slice(split + 1) };
+              }) },
+              select: { id: true, employerId: true, name: true },
+            })
+          : [];
         const siteMap = new Map(sites.map((site: any) => [`${site.employerId}|${site.name}`, site.id]));
 
         for (const row of rows) {
@@ -674,6 +666,23 @@ export async function commitBatch(batchId: string, options: CommitOptions = {}) 
       (tx: any) => commitRowsChunk(tx, batch.reportKey, chunk, stats, batchId),
       { timeout: IMPORT_TX_TIMEOUT_MS, maxWait: 30000 },
     );
+  }
+
+  // Refresh current headcount projections once per touched employer, after all
+  // snapshot chunks are committed. The previous implementation did this inside
+  // every chunk, multiplying queries dramatically for large workforce feeds.
+  if (batch.reportKey === "workforce_snapshots") {
+    for (const employerId of touchedEmployers) {
+      const latest = await prisma.employerHeadcountSnapshot.findFirst({
+        where: { employerId, sourceDeletedAt: null },
+        orderBy: [{ asOfDate: "desc" }, { sourceUpdatedAt: "desc" }],
+        select: { eligibleCount: true, asOfDate: true },
+      });
+      await prisma.employer.update({
+        where: { id: employerId },
+        data: { eligibleCount: latest?.eligibleCount ?? 0, eligibleCountAsAt: latest?.asOfDate ?? null },
+      });
+    }
   }
 
   await prisma.importBatch.update({

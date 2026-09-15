@@ -10,11 +10,14 @@ import { uploadAndValidate, commitBatch } from "./importService.js";
 import { prisma } from "./snapshotBuilder.js";
 
 export type JobStatus = "PENDING" | "DONE" | "FAILED";
+export type JobPhase = "UPLOADING" | "VALIDATING" | "COMMITTING" | "DONE" | "FAILED";
 
 export interface AsyncJob {
   status: JobStatus;
   result?: any;
   error?: string;
+  phase: JobPhase;
+  startedAt: number;
   timer: NodeJS.Timeout;
 }
 
@@ -25,7 +28,7 @@ const commitJobs = new Map<string, AsyncJob>();
 function startJob(map: Map<string, AsyncJob>): string {
   const id = randomUUID();
   const timer = setTimeout(() => map.delete(id), 30 * 60 * 1000);
-  map.set(id, { status: "PENDING", timer });
+  map.set(id, { status: "PENDING", phase: "UPLOADING", startedAt: Date.now(), timer });
   return id;
 }
 
@@ -40,22 +43,48 @@ export function startUploadJob(opts: {
 
   (async () => {
     try {
+      job.phase = "VALIDATING";
       const { batch, result } = await uploadAndValidate(opts);
-      job.status = "DONE";
-      job.result = {
-        batchId: batch.id,
-        status: batch.status,
-        rowCount: result.rowCount,
-        errors: result.errors.slice(0, 200),
-        errorCount: result.errors.length,
-        missingColumns: result.missingColumns,
-        unknownColumns: result.unknownColumns,
-        preview: result.rows.slice(0, 10),
-      };
+
+      // A valid import is now committed automatically. The HTTP request has
+      // already returned 202, so parsing, DB writes and score recomputation
+      // never block the admin page. This also removes the old VALIDATED dead-end
+      // where a user had to manually press Commit after every upload.
+      if (result.ok && batch.status === "VALIDATED") {
+        job.phase = "COMMITTING";
+        const commitResult = await commitBatch(batch.id);
+        job.status = "DONE";
+        job.phase = "DONE";
+        job.result = {
+          batchId: batch.id,
+          status: "COMMITTED",
+          rowCount: result.rowCount,
+          errors: [],
+          errorCount: 0,
+          missingColumns: result.missingColumns,
+          unknownColumns: result.unknownColumns,
+          preview: result.rows.slice(0, 10),
+          ...commitResult,
+        };
+      } else {
+        job.status = "DONE";
+        job.phase = "DONE";
+        job.result = {
+          batchId: batch.id,
+          status: batch.status,
+          rowCount: result.rowCount,
+          errors: result.errors.slice(0, 200),
+          errorCount: result.errors.length,
+          missingColumns: result.missingColumns,
+          unknownColumns: result.unknownColumns,
+          preview: result.rows.slice(0, 10),
+        };
+      }
     } catch (e: any) {
       job.status = "FAILED";
+      job.phase = "FAILED";
       job.error = e?.message || String(e);
-      console.error("[upload-job] validation failed:", e);
+      console.error("[upload-job] import failed:", e);
     }
   })();
 

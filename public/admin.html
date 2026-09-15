@@ -1136,25 +1136,22 @@ function wireDrop(){
   d.addEventListener('drop',e=>{ if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); });
 }
 
-async function pollJob(url, label){
+async function pollJob(url, label, onProgress){
   const started = Date.now();
-  let dots = 0;
 
   while(Date.now() - started < 30 * 60 * 1000){
-    dots = (dots + 1) % 4;
-    $('#result').innerHTML = `<div class="banner ok">${label}${'.'.repeat(dots)} large files can take several minutes. Keep this tab open.</div>`;
+    await new Promise(resolve => setTimeout(resolve, 750));
 
-    await new Promise(resolve => setTimeout(resolve, 1500));
-
-    const r = await fetch(url);
+    const r = await fetch(url, {cache:'no-store'});
     const d = await r.json().catch(() => null);
 
     if(!r.ok || !d) throw new Error(d?.error || `${label} status check failed: HTTP ${r.status}`);
     if(d.status === 'DONE') return d;
     if(d.status === 'FAILED') throw new Error(d.error || `${label} failed`);
+    if(onProgress) onProgress(d);
   }
 
-  throw new Error(`${label} is still running after 30 minutes. Check Import history before retrying.`);
+  throw new Error(`${label} is still running after 30 minutes. Check Import history.`);
 }
 
 
@@ -1167,9 +1164,32 @@ async function upload(file){
     let res = await r.json().catch(() => null);
     if(!r.ok || !res) throw new Error(res?.error || `server error ${r.status}`);
 
-    // Server now returns 202 and validates in the background.
+    // The server accepts the upload immediately. Validation, import and score
+    // recomputation continue in the background, so the admin UI never waits on
+    // a large file. We still monitor the job and update the result when it lands.
     if(r.status === 202 && res.jobId){
-      res = await pollJob(`${API}/api/admin/upload-jobs/${res.jobId}`, 'Validating');
+      const jobId = res.jobId;
+      $('#result').innerHTML = `<div class="banner ok">✓ Upload received instantly. Validation, loading and score recomputation are running in the background.</div>`;
+      loadHistory();
+
+      // Do not await the job here. The admin page is immediately usable again.
+      // The monitor updates this panel only if the user has not started another
+      // upload in the meantime.
+      pollJob(`${API}/api/admin/upload-jobs/${jobId}`, 'Import', d => {
+        const phase = d.phase === 'COMMITTING' ? 'Loading data & recomputing scores' : 'Validating report';
+        if($('#result').text().includes('Upload received') || $('#result').text().includes('Validating') || $('#result').text().includes('Loading data')){
+          $('#result').innerHTML = `<div class="banner ok">⏳ ${phase}… Processing in the background. You can keep using the admin page.</div>`;
+        }
+      }).then(done => {
+        if(!done) return;
+        if(done.batchId) LAST_BATCH = done.batchId;
+        renderResult(done);
+        loadHistory();
+      }).catch(e => {
+        $('#result').innerHTML = `<div class="banner err">✕ Background import failed: ${e.message}. Check Import history.</div>`;
+        loadHistory();
+      });
+      return;
     }
 
     LAST_BATCH = res.batchId;
@@ -1182,9 +1202,11 @@ async function upload(file){
 
 
 function renderResult(res){
-  if(res.status === 'VALIDATED'){
+  if(res.status === 'COMMITTED'){
+    $('#result').innerHTML = `<div class="banner ok">✓ Imported <strong>${res.rowCount}</strong> rows successfully. Dashboards and Financial Wellness scores were refreshed in the background.</div>${previewTable(res.preview)}`;
+  } else if(res.status === 'VALIDATED'){
     $('#result').innerHTML = `
-      <div class="banner ok">✓ Validated <strong>${res.rowCount}</strong> rows with no errors. Review the preview, then commit to update the dashboards.</div>
+      <div class="banner ok">✓ Validated <strong>${res.rowCount}</strong> rows. The import is staged and ready.</div>
       ${previewTable(res.preview)}
       <div class="row section-gap">
         <button class="btn btn-green" onclick="commit('${res.batchId}')">Commit & recompute scores</button>

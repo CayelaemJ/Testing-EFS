@@ -13,7 +13,7 @@ const commitJobs = new Map();
 function startJob(map) {
     const id = randomUUID();
     const timer = setTimeout(() => map.delete(id), 30 * 60 * 1000);
-    map.set(id, { status: "PENDING", timer });
+    map.set(id, { status: "PENDING", phase: "UPLOADING", startedAt: Date.now(), timer });
     return id;
 }
 export function startUploadJob(opts) {
@@ -21,27 +21,40 @@ export function startUploadJob(opts) {
     const job = uploadJobs.get(jobId);
     (async () => {
         try {
+            job.phase = "VALIDATING";
             const { batch, result } = await uploadAndValidate(opts);
-            job.status = "DONE";
-            job.result = {
-                batchId: batch.id,
-                status: batch.status,
-                rowCount: result.rowCount,
-                errors: result.errors.slice(0, 200),
-                errorCount: result.errors.length,
-                missingColumns: result.missingColumns,
-                unknownColumns: result.unknownColumns,
-                preview: result.rows.slice(0, 10),
-            };
+            // Valid imports commit automatically in the background.
+            if (result.ok && batch.status === "VALIDATED") {
+                job.phase = "COMMITTING";
+                const commitResult = await commitBatch(batch.id);
+                job.status = "DONE";
+                job.phase = "DONE";
+                job.result = {
+                    batchId: batch.id, status: "COMMITTED", rowCount: result.rowCount,
+                    errors: [], errorCount: 0, missingColumns: result.missingColumns,
+                    unknownColumns: result.unknownColumns, preview: result.rows.slice(0, 10), ...commitResult,
+                };
+            } else {
+                job.status = "DONE";
+                job.phase = "DONE";
+                job.result = {
+                    batchId: batch.id, status: batch.status, rowCount: result.rowCount,
+                    errors: result.errors.slice(0, 200), errorCount: result.errors.length,
+                    missingColumns: result.missingColumns, unknownColumns: result.unknownColumns,
+                    preview: result.rows.slice(0, 10),
+                };
+            }
         }
         catch (e) {
             job.status = "FAILED";
+            job.phase = "FAILED";
             job.error = e?.message || String(e);
-            console.error("[upload-job] validation failed:", e);
+            console.error("[upload-job] import failed:", e);
         }
     })();
     return jobId;
 }
+
 export function getUploadJob(jobId) {
     return uploadJobs.get(jobId);
 }

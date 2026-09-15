@@ -184,27 +184,8 @@ async function commitRowsChunk(tx, reportKey, rows, stats, batchId) {
                 else
                     row.is_deleted ? stats.deleted++ : stats.inserted++;
             }
-            // Keep the Employer cache aligned with the newest non-retracted snapshot.
-            // A tombstone for the latest month must fall back to the preceding valid
-            // month rather than caching the deleted value as the current denominator.
-            const employerRefs = [...new Set(rows.map((row) => String(row.employer_ref)))];
-            for (const employerRef of employerRefs) {
-                const latest = await tx.employerHeadcountSnapshot.findFirst({
-                    where: { employerId: employerRef, sourceDeletedAt: null },
-                    orderBy: [{ asOfDate: "desc" }, { sourceUpdatedAt: "desc" }],
-                });
-                const employer = await tx.employer.findUnique({ where: { id: employerRef } });
-                if (employer) {
-                    await tx.employer.update({
-                        where: { id: employerRef },
-                        data: {
-                            eligibleCount: latest?.eligibleCount ?? 0,
-                            eligibleCountAsAt: latest?.asOfDate ?? null,
-                        },
-                    });
-                }
-            }
-            break;
+            // Employer cache is refreshed once after the full batch.
+        break;
         }
         case "employees": {
             const siteKeys = new Map();
@@ -215,7 +196,16 @@ async function commitRowsChunk(tx, reportKey, rows, stats, batchId) {
             for (const site of siteKeys.values()) {
                 await tx.site.upsert({ where: { employerId_name: site }, create: site, update: {} });
             }
-            const sites = await tx.site.findMany({ select: { id: true, employerId: true, name: true } });
+            const siteKeyList = [...siteKeys.keys()];
+            const sites = siteKeyList.length
+                ? await tx.site.findMany({
+                    where: { OR: siteKeyList.map((key) => {
+                        const split = key.indexOf("|");
+                        return { employerId: key.slice(0, split), name: key.slice(split + 1) };
+                    }) },
+                    select: { id: true, employerId: true, name: true },
+                })
+                : [];
             const siteMap = new Map(sites.map((site) => [`${site.employerId}|${site.name}`, site.id]));
             for (const row of rows) {
                 const where = { employerId_payrollRef: { employerId: row.employer_ref, payrollRef: row.payroll_ref } };
@@ -615,6 +605,19 @@ export async function commitBatch(batchId, options = {}) {
         chunks.push([]);
     for (const chunk of chunks) {
         await prisma.$transaction((tx) => commitRowsChunk(tx, batch.reportKey, chunk, stats, batchId), { timeout: IMPORT_TX_TIMEOUT_MS, maxWait: 30000 });
+    }
+    if (batch.reportKey === "workforce_snapshots") {
+        for (const employerId of touchedEmployers) {
+            const latest = await prisma.employerHeadcountSnapshot.findFirst({
+                where: { employerId, sourceDeletedAt: null },
+                orderBy: [{ asOfDate: "desc" }, { sourceUpdatedAt: "desc" }],
+                select: { eligibleCount: true, asOfDate: true },
+            });
+            await prisma.employer.update({
+                where: { id: employerId },
+                data: { eligibleCount: latest?.eligibleCount ?? 0, eligibleCountAsAt: latest?.asOfDate ?? null },
+            });
+        }
     }
     await prisma.importBatch.update({
         where: { id: batchId },

@@ -6,6 +6,7 @@
 // ════════════════════════════════════════════════════════════════════
 
 import Fastify, { FastifyRequest, FastifyReply } from "fastify";
+import { Prisma } from "@prisma/client";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import cookie from "@fastify/cookie";
@@ -500,6 +501,12 @@ app.get<{ Params: { key: string }; Querystring: { fmt?: string } }>(
 );
 
 // upload a report file -> parse + validate -> staged batch (NOT yet live)
+// Returns 202 immediately and validates in the background; the browser
+// polls /api/admin/upload-jobs/:jobId (admin.html already does this — the
+// route just needs to exist). Parsing/validating a large CSV/XLSX is CPU
+// and DB work that can run for a while; doing it inline on the request
+// blocked the whole HTTP connection (and the rest of the server) until it
+// finished, which is what made uploads feel like they were hanging.
 app.post<{ Params: { key: string } }>(
   "/api/admin/reports/:key/upload",
   async (req, reply) => {
@@ -508,26 +515,29 @@ app.post<{ Params: { key: string } }>(
       const file = await req.file();
       if (!file) return reply.code(400).send({ error: "no file uploaded" });
       const buffer = await file.toBuffer();
-      const { batch, result } = await uploadAndValidate({
+      const jobId = startUploadJob({
         reportKey: req.params.key,
         filename: file.filename,
         buffer,
         uploadedBy: (await currentUser(req))?.email ?? undefined,
       });
-      return {
-        batchId: batch.id,
-        status: batch.status,
-        rowCount: result.rowCount,
-        errors: result.errors.slice(0, 200),
-        errorCount: result.errors.length,
-        missingColumns: result.missingColumns,
-        unknownColumns: result.unknownColumns,
-        preview: result.rows.slice(0, 10),
-      };
+      return reply.code(202).send({ status: "ACCEPTED", jobId });
     } catch (e: any) {
       req.log.error(e);
       return reply.code(400).send({ error: `could not read the file: ${e.message}. Check it's a valid CSV/Excel and that text with commas is wrapped in quotes.` });
     }
+  },
+);
+
+app.get<{ Params: { jobId: string } }>(
+  "/api/admin/upload-jobs/:jobId",
+  async (req, reply) => {
+    if (!(await requireAdmin(req, reply))) return;
+    const job = getUploadJob(req.params.jobId);
+    if (!job) return reply.code(404).send({ error: "unknown upload job" });
+    if (job.status === "PENDING") return { status: "PROCESSING" };
+    if (job.status === "FAILED") return { status: "FAILED", error: job.error };
+    return { status: "DONE", ...job.result };
   },
 );
 
@@ -846,6 +856,26 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     });
 
     const periodSet = new Set(snapshots.map((s: any) => s.period));
+
+    // ScoreSnapshot is the preferred source for labelled scores, but it is not
+    // guaranteed to exist for every month covered by imported workforce data.
+    // Build the period dimension from the immutable EmployeeVersion observation
+    // table as well. PostgreSQL does the DISTINCT/month extraction; never pull
+    // 100k employee rows into Node just to populate a selector.
+    const observedPeriods = await prisma.$queryRaw<Array<{ period: string }>>(Prisma.sql`
+      SELECT DISTINCT to_char(date_trunc('month', ev."observedAt"), 'YYYY-MM') AS period
+      FROM "EmployeeVersion" ev
+      INNER JOIN "Employee" e ON e.id = ev."employeeId"
+      WHERE e."employerId" = ${employerId}
+        AND e."sourceDeletedAt" IS NULL
+        AND ev."isDeleted" = false
+      ORDER BY period DESC
+      LIMIT 24
+    `);
+    for (const row of observedPeriods) {
+      if (row?.period) periodSet.add(row.period);
+    }
+
     const latestEmployee = await prisma.employee.findFirst({
       where: { employerId, sourceDeletedAt: null },
       select: { observedAt: true },
@@ -853,9 +883,9 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     });
     if (latestEmployee?.observedAt) periodSet.add(monthKey(latestEmployee.observedAt));
 
-    // Return at most the latest 12 real reporting months. Keep this query O(12)
-    // and never invoke getDashboardPayload from inside the period-list endpoint.
-    // This is critical on mobile and when Region/Income is already selected.
+    // Return at most the latest 12 real reporting months. Keep the selector
+    // cheap: only the indexed observation dimension and persisted snapshots are
+    // touched; never invoke getDashboardPayload from this endpoint.
     const latestPeriods = [...periodSet].sort().reverse().slice(0, 12);
     const snapshotByPeriod = new Map(snapshots.map((row: any) => [row.period, row]));
     const snapshotScore = (snap: any): number | null => {
@@ -878,10 +908,35 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
       const raw = Number(snap.rawScore);
       return Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : null;
     };
-    return latestPeriods.map(period => {
+
+    const results = latestPeriods.map(period => {
       const snap: any = snapshotByPeriod.get(period);
       return { period, optimiseScore: snapshotScore(snap) };
     });
+
+    // Most months already have a usable persisted snapshot (the fast path
+    // above). But a period can legitimately have none yet — data just
+    // imported for it, the snapshot job hasn't run, or the row is stuck at
+    // an old payloadVersion until scripts/rebuild-score-snapshots.ts is
+    // re-run — and in that case the picker was showing "Score unavailable"
+    // forever instead of a number. Rather than silently leaving those
+    // periods blank, compute the handful that are missing on demand — this
+    // reuses the same cached dashboard-payload path getDashboardPayload
+    // already uses everywhere else, so it's cheap after the first request
+    // and never touches the months that already resolved above.
+    const missing = results.filter(r => r.optimiseScore == null);
+    if (missing.length) {
+      await Promise.all(missing.map(async (r) => {
+        try {
+          const live: any = await getDashboardPayload(employerId, { period: r.period });
+          if (live?.wellness?.complete && live?.wellness?.score != null) {
+            r.optimiseScore = Math.round(Number(live.wellness.score));
+          }
+        } catch { /* leave unavailable — the picker still shows the period itself */ }
+      }));
+    }
+
+    return results;
   },
 );
 

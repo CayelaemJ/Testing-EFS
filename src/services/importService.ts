@@ -246,9 +246,9 @@ async function commitRowsChunk(
 
         }
 
-        // Employer's current headcount cache is refreshed once after the full
-        // batch finishes (not once per 1k/2k-row chunk). This avoids a large
-        // amount of repeated findFirst + update traffic during big imports.
+        // Employer eligibleCount cache is refreshed once after the entire
+        // workforce snapshot batch commits. Doing this inside every 1k-row
+        // transaction caused repeated latest-snapshot scans and employer updates.
         break;
       }
 
@@ -260,13 +260,12 @@ async function commitRowsChunk(
         for (const site of siteKeys.values()) {
           await tx.site.upsert({ where: { employerId_name: site }, create: site, update: {} });
         }
-        const siteKeyList = [...siteKeys.keys()];
-        const sites = siteKeyList.length
+        const sitePairs = [...siteKeys.values()];
+        const sites = sitePairs.length
           ? await tx.site.findMany({
-              where: { OR: siteKeyList.map((key) => {
-                const split = key.indexOf("|");
-                return { employerId: key.slice(0, split), name: key.slice(split + 1) };
-              }) },
+              where: {
+                OR: sitePairs.map((site) => ({ employerId: site.employerId, name: site.name })),
+              },
               select: { id: true, employerId: true, name: true },
             })
           : [];
@@ -668,21 +667,26 @@ export async function commitBatch(batchId: string, options: CommitOptions = {}) 
     );
   }
 
-  // Refresh current headcount projections once per touched employer, after all
-  // snapshot chunks are committed. The previous implementation did this inside
-  // every chunk, multiplying queries dramatically for large workforce feeds.
-  if (batch.reportKey === "workforce_snapshots") {
-    for (const employerId of touchedEmployers) {
-      const latest = await prisma.employerHeadcountSnapshot.findFirst({
-        where: { employerId, sourceDeletedAt: null },
-        orderBy: [{ asOfDate: "desc" }, { sourceUpdatedAt: "desc" }],
-        select: { eligibleCount: true, asOfDate: true },
-      });
-      await prisma.employer.update({
-        where: { id: employerId },
-        data: { eligibleCount: latest?.eligibleCount ?? 0, eligibleCountAsAt: latest?.asOfDate ?? null },
-      });
-    }
+  // Refresh workforce denominator caches once per affected employer, rather
+  // than once per 1k-row transaction. This is a major speed-up for large
+  // workforce snapshot files.
+  if (batch.reportKey === "workforce_snapshots" && touchedEmployers.size) {
+    await prisma.$transaction(async (tx: any) => {
+      for (const employerRef of touchedEmployers) {
+        const latest = await tx.employerHeadcountSnapshot.findFirst({
+          where: { employerId: employerRef, sourceDeletedAt: null },
+          orderBy: [{ asOfDate: "desc" }, { sourceUpdatedAt: "desc" }],
+          select: { eligibleCount: true, asOfDate: true },
+        });
+        await tx.employer.update({
+          where: { id: employerRef },
+          data: {
+            eligibleCount: latest?.eligibleCount ?? 0,
+            eligibleCountAsAt: latest?.asOfDate ?? null,
+          },
+        });
+      }
+    });
   }
 
   await prisma.importBatch.update({

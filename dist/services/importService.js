@@ -97,7 +97,7 @@ export async function uploadAndValidate(opts) {
             errorCount: errors.length,
             rowCount: rows.length,
             errors: errors.length ? { validationErrors: errors } : undefined,
-            stagedRows: ok ? sampleRows : undefined,
+            stagedRows: ok ? rows : undefined,
         },
     });
     return {

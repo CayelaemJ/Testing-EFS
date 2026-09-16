@@ -123,7 +123,7 @@ export async function uploadAndValidate(opts: {
       errorCount: errors.length,
       rowCount: rows.length,
       errors: errors.length ? ({ validationErrors: errors } as unknown as Json) : undefined,
-      stagedRows: ok ? (sampleRows as unknown as Json) : undefined,
+      stagedRows: ok ? (rows as unknown as Json) : undefined,
     },
   });
 

@@ -15,8 +15,8 @@ import { readFile } from "node:fs/promises";
 import { prisma, snapshotEmployer, getDashboardPayload } from "./services/snapshotBuilder.js";
 import { REPORT_FORMATS, LOAD_ORDER, getFormat } from "./services/reportFormats.js";
 import { csvTemplate, xlsxTemplate, formatManifest } from "./services/templateGenerator.js";
-import { uploadAndValidate, revertBatch, resetAllData } from "./services/importService.js";
-import { startCommitJob, getCommitJob } from "./services/asyncJobs.js";
+import { revertBatch, resetAllData } from "./services/importService.js";
+import { startUploadJob, getUploadJob, startCommitJob, getCommitJob } from "./services/asyncJobs.js";
 import { getConfig as getSyncConfig, saveConfig as saveSyncConfig, publicConfig as publicSyncConfig, testConnection as testSyncConnection, runSync, recentSyncLogs } from "./services/syncService.js";
 import { listPartners, createPartner, updatePartner, deletePartner, assignUserToPartner, assignEmployerToPartner, themeForUser, themeForSlug } from "./services/partnerService.js";
 import { login, resolveSession, destroySession, canViewEmployer, canAccessModule, allowedEmployerIds } from "./services/authService.js";
@@ -24,7 +24,7 @@ import { createUser, listUsers, updateUser, resetPassword, completeSetup, deacti
 import { recordEvent, engagementSummary } from "./services/analyticsService.js";
 import { notifyAdmins, notifyScoreChangeIfCurrentPeriod, runStaleAccountCheck, runWeeklyDigestIfDue } from "./services/automationService.js";
 import { logAdminAction, listAuditLog } from "./services/auditService.js";
-import { exportAuditLogCsv } from "./services/exportService.js";
+import { exportAuditLogCsv, exportImportBatchCsv } from "./services/exportService.js";
 import { ensureSectionDefaults, listSections, updateSection, grantUserSection, revokeUserSection, sectionsForUser } from "./services/sectionService.js";
 import { publicEmailConfig, saveEmailConfig, testEmailConnection, createReportSchedule, listReportSchedules, updateReportSchedule, deleteReportSchedule, sendReportNow, recentReportDeliveries, runDueReports } from "./services/reportScheduler.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -530,7 +530,7 @@ app.get("/api/admin/reports/:key/template", async (req, reply) => {
     reply.header("Content-Disposition", `attachment; filename="${format.key}_template.csv"`);
     return reply.send(csvTemplate(format));
 });
-// upload a report file -> parse + validate -> staged batch (NOT yet live)
+// upload a report file -> parse + validate + commit in the background
 app.post("/api/admin/reports/:key/upload", async (req, reply) => {
     if (!(await requireAdmin(req, reply)))
         return;
@@ -539,27 +539,30 @@ app.post("/api/admin/reports/:key/upload", async (req, reply) => {
         if (!file)
             return reply.code(400).send({ error: "no file uploaded" });
         const buffer = await file.toBuffer();
-        const { batch, result } = await uploadAndValidate({
+        const jobId = startUploadJob({
             reportKey: req.params.key,
             filename: file.filename,
             buffer,
             uploadedBy: (await currentUser(req))?.email ?? undefined,
         });
-        return {
-            batchId: batch.id,
-            status: batch.status,
-            rowCount: result.rowCount,
-            errors: result.errors.slice(0, 200),
-            errorCount: result.errors.length,
-            missingColumns: result.missingColumns,
-            unknownColumns: result.unknownColumns,
-            preview: result.rows.slice(0, 10),
-        };
+        return reply.code(202).send({ status: "ACCEPTED", jobId });
     }
     catch (e) {
         req.log.error(e);
         return reply.code(400).send({ error: `could not read the file: ${e.message}. Check it's a valid CSV/Excel and that text with commas is wrapped in quotes.` });
     }
+});
+app.get("/api/admin/upload-jobs/:jobId", async (req, reply) => {
+    if (!(await requireAdmin(req, reply)))
+        return;
+    const job = getUploadJob(req.params.jobId);
+    if (!job)
+        return reply.code(404).send({ error: "unknown upload job" });
+    if (job.status === "PENDING")
+        return { status: "PROCESSING" };
+    if (job.status === "FAILED")
+        return { status: "FAILED", error: job.error };
+    return { status: "DONE", ...job.result };
 });
 // commit a validated batch -> writes live + recomputes affected snapshots
 // Returns 202 immediately; the browser polls /api/admin/commit-jobs/:jobId.
@@ -593,6 +596,28 @@ app.post("/api/admin/batches/:batchId/revert", async (req, reply) => {
         return reply.code(409).send({ error: e?.message || "This import cannot be safely reverted." });
     }
 });
+// download the exact canonical rows that were uploaded for an import batch
+app.get("/api/admin/batches/:batchId/download", async (req, reply) => {
+    if (!(await requireAdmin(req, reply)))
+        return;
+    try {
+        const batch = await prisma.importBatch.findUnique({
+            where: { id: req.params.batchId },
+            select: { filename: true, reportKey: true },
+        });
+        if (!batch)
+            return reply.code(404).send({ error: "import batch not found" });
+        const csv = await exportImportBatchCsv(req.params.batchId);
+        reply.header("Content-Type", "text/csv; charset=utf-8");
+        reply.header("Content-Disposition", `attachment; filename="${batch.reportKey}_uploaded_${new Date().toISOString().slice(0, 10)}.csv"`);
+        return reply.send(csv);
+    }
+    catch (e) {
+        req.log.error({ err: e, batchId: req.params.batchId }, "import batch download failed");
+        return reply.code(404).send({ error: e?.message || "uploaded data is no longer available" });
+    }
+});
+
 // import history
 app.get("/api/admin/batches", async (req, reply) => {
     if (!(await requireAdmin(req, reply)))

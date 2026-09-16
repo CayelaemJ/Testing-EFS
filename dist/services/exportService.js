@@ -1,8 +1,11 @@
 // ════════════════════════════════════════════════════════════════════
 //  ADMIN DATA EXPORT — CSV
 //  Simple, dependency-free CSV building (no xlsx tooling needed here).
+//  Added this because sometimes we might want to see the data, that have we have loaded in the app This will help us so much
+//  In regards to detecting anomalies, loading data into python for exploratory analysis
 // ════════════════════════════════════════════════════════════════════
 import { prisma } from "./authService.js";
+import { getFormat } from "./reportFormats.js";
 function csvEscape(value) {
     if (value == null)
         return "";
@@ -71,4 +74,24 @@ export async function exportUsersCsv() {
         orderBy: { createdAt: "desc" },
     });
     return toCsv(rows, ["id", "email", "name", "role", "active", "partnerId", "createdAt", "revokedAt", "revokedReason", "revokedBy"]);
+}
+
+
+export async function exportImportBatchCsv(batchId) {
+    const batch = await prisma.importBatch.findUnique({
+        where: { id: batchId },
+        select: { id: true, reportKey: true, filename: true, fileFormat: true },
+    });
+    if (!batch)
+        throw new Error("import batch not found");
+    const rows = await prisma.importBatchRow.findMany({
+        where: { batchId },
+        orderBy: { rowIndex: "asc" },
+        select: { data: true },
+    });
+    if (!rows.length)
+        throw new Error("no uploaded rows are available for this batch");
+    const format = getFormat(batch.reportKey);
+    const keys = format?.fields.map((f) => f.name) ?? Object.keys(rows[0].data ?? {});
+    return toCsv(rows.map((r) => r.data), keys);
 }

@@ -4,6 +4,7 @@
 // ════════════════════════════════════════════════════════════════════
 
 import { prisma } from "./authService.js";
+import { getFormat } from "./reportFormats.js";
 
 function csvEscape(value: unknown): string {
   if (value == null) return "";
@@ -79,4 +80,28 @@ export async function exportUsersCsv() {
     orderBy: { createdAt: "desc" },
   });
   return toCsv(rows as any, ["id", "email", "name", "role", "active", "partnerId", "createdAt", "revokedAt", "revokedReason", "revokedBy"]);
+}
+
+
+/** Export the exact canonical rows staged by an uploaded import batch.
+ * This is intentionally the uploaded feed, not a transformed projection from
+ * the live tables, so admins can download exactly what was imported.
+ */
+export async function exportImportBatchCsv(batchId: string) {
+  const batch = await prisma.importBatch.findUnique({
+    where: { id: batchId },
+    select: { id: true, reportKey: true, filename: true, fileFormat: true },
+  });
+  if (!batch) throw new Error("import batch not found");
+
+  const rows = await prisma.importBatchRow.findMany({
+    where: { batchId },
+    orderBy: { rowIndex: "asc" },
+    select: { data: true },
+  });
+  if (!rows.length) throw new Error("no uploaded rows are available for this batch");
+
+  const format = getFormat(batch.reportKey);
+  const keys = format?.fields.map((f) => f.name) ?? Object.keys((rows[0].data ?? {}) as Record<string, unknown>);
+  return toCsv(rows.map((r) => r.data as Record<string, unknown>), keys);
 }

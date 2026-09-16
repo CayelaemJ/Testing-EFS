@@ -26,7 +26,7 @@ import { createUser, listUsers, updateUser, resetPassword, completeSetup, deacti
 import { recordEvent, engagementSummary } from "./services/analyticsService.js";
 import { notifyAdmins, notifyScoreChangeIfCurrentPeriod, runStaleAccountCheck, runWeeklyDigestIfDue } from "./services/automationService.js";
 import { logAdminAction, listAuditLog } from "./services/auditService.js";
-import { exportAuditLogCsv } from "./services/exportService.js";
+import { exportAuditLogCsv, exportImportBatchCsv } from "./services/exportService.js";
 import { ensureSectionDefaults, listSections, updateSection, grantUserSection, revokeUserSection, sectionsForUser } from "./services/sectionService.js";
 import { publicEmailConfig, saveEmailConfig, testEmailConnection, createReportSchedule, listReportSchedules, updateReportSchedule, deleteReportSchedule, sendReportNow, recentReportDeliveries, runDueReports } from "./services/reportScheduler.js";
 import type { ScheduleInput } from "./services/reportScheduler.js";
@@ -578,6 +578,25 @@ app.post<{ Params: { batchId: string } }>(
   },
 );
 
+// download the exact canonical rows that were uploaded for an import batch
+app.get<{ Params: { batchId: string } }>("/api/admin/batches/:batchId/download", async (req, reply) => {
+  if (!(await requireAdmin(req, reply))) return;
+  try {
+    const batch = await prisma.importBatch.findUnique({
+      where: { id: req.params.batchId },
+      select: { filename: true, reportKey: true },
+    });
+    if (!batch) return reply.code(404).send({ error: "import batch not found" });
+    const csv = await exportImportBatchCsv(req.params.batchId);
+    reply.header("Content-Type", "text/csv; charset=utf-8");
+    reply.header("Content-Disposition", `attachment; filename="${batch.reportKey}_uploaded_${new Date().toISOString().slice(0,10)}.csv"`);
+    return reply.send(csv);
+  } catch (e: any) {
+    req.log.error({ err: e, batchId: req.params.batchId }, "import batch download failed");
+    return reply.code(404).send({ error: e?.message || "uploaded data is no longer available" });
+  }
+});
+
 // import history
 app.get("/api/admin/batches", async (req, reply) => {
   if (!(await requireAdmin(req, reply))) return;
@@ -1053,7 +1072,7 @@ function startAutomationScheduler(app: any) {
   setTimeout(tick, 45000);
 }
 
-// ── scheduled-report checker: claims due jobs in the database and sends them via SMTP ──
+// ── scheduled-report checker: claims due jobs in the database and sends them via SMTP, we do need to make sure that this can be altered to schema changes ──
 function startReportScheduler(app: any) {
   const CHECK_MS = 60 * 1000;
   const tick = async () => {
@@ -1064,7 +1083,7 @@ function startReportScheduler(app: any) {
   setTimeout(tick, 20000);
 }
 
-// ── portfolio view: same dated calculation model as each employer dashboard ──
+// ── portfolio view: same dated calculation model as each employer dashboard only execs and people can see this ──
 app.get<{ Querystring: { period?: string; quarter?: string; range?: "30d" | "quarter" | "all" | "month" | "30" | "q" | "latest" } }>(
   "/api/portfolio",
   async (req, reply) => {

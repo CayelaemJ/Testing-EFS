@@ -164,7 +164,7 @@ async function commitRowsChunk(
       )];
       if (!keys.length) return { employeeIds: new Map<string, string>(), platformUserIds: new Map<string, string>() };
 
-      const employees = await tx.employee.findMany({
+      const employees = await prisma.employee.findMany({
         where: {
           OR: keys.map((key) => {
             const split = key.indexOf("|");

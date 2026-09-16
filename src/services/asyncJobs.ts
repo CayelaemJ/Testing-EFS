@@ -36,7 +36,7 @@ export function startUploadJob(opts: any) {
         rowCount: result.rowCount,
         errors: result.errors.slice(0, 200),
         errorCount: result.errors.length,
-        errorSummary: result.errorSummary || "",
+        errorSummary: "",
         missingColumns: result.missingColumns,
         unknownColumns: result.unknownColumns,
         preview: result.rows.slice(0, 10),

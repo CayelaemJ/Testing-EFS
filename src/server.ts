@@ -853,15 +853,10 @@ app.get<{ Params: { employerId: string }; Querystring: { site?: string; income?:
     // the dashboard request after a period is selected; the period picker must
     // never calculate twelve full cohort dashboards.
     const employerId = req.params.employerId;
-<<<<<<< HEAD
     // The picker is deliberately a fixed rolling window: twelve months of
     // actual employer data, newest first. Do not expose every historical row
     // and do not calculate the dashboard twelve times just to build a menu
-=======
-    // The period picker is a dimension selector, not a dashboard calculator.
-    // Never rebuild the full dashboard once per month just to populate it.
-
->>>>>>> d36634937a265be18bdea518315e13decbced26d
+    // as a dimension selector, not a dashboard calculator.
     const snapshots = await prisma.scoreSnapshot.findMany({
       where: { employerId, payloadVersion: { gte: 4 } },
       select: {

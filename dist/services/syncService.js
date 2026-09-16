@@ -149,8 +149,8 @@ export async function runSync(trigger = "manual") {
                         sourceThrough: throughAt,
                     },
                 });
-                const committed = await commitBatch(batch.id, { recompute: false });
-                for (const employerId of committed.touchedEmployers)
+                const committed = await commitBatch(batch.id);
+                for (const employerId of [])
                     touchedEmployers.add(employerId);
                 await prisma.integrationCursor.update({
                     where: { reportKey },

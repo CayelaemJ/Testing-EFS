@@ -31,19 +31,19 @@ export function startUploadJob(opts: any) {
       // Always mark DONE — let frontend decide if it's an error or success based on status/errorCount
       job.status = "DONE";
       job.result = {
-        batchId: batch.id,
-        status: batch.status, // Can be VALIDATED, VALIDATION_FAILED, etc.
+        batchId: batch?.id,
+        status: batch?.status,
         rowCount: result.rowCount,
         errors: result.errors.slice(0, 200),
         errorCount: result.errors.length,
-        errorSummary: result.errorSummary || "", // Include the formatted error summary
+        errorSummary: result.errorSummary || "",
         missingColumns: result.missingColumns,
         unknownColumns: result.unknownColumns,
         preview: result.rows.slice(0, 10),
       };
 
       // If validation failed, don't auto-commit
-      if (!result.ok || batch.status !== "VALIDATED") {
+      if (!result.ok || batch?.status !== "VALIDATED") {
         return;
       }
 

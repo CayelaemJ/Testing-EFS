@@ -1,32 +1,8 @@
-// ════════════════════════════════════════════════════════════════════
-//  IMPORT PARSER + VALIDATOR
-//  CSV, XLSX, JSON, API and direct SQL use the same strict canonical contract.
-//  Validation is split: early (format/coercion/rules on first row) and deferred
-//  (duplicate detection at end to skip expensive checks during streaming).
-// ════════════════════════════════════════════════════════════════════
-
 import * as XLSX from "xlsx";
 import { parse as parseCsv } from "csv-parse/sync";
-import { parse as parseCsvStream } from "csv-parse";
-import { PrismaClient } from "@prisma/client";
-import { ReportFormat, FieldSpec } from "./reportFormats.js";
-import { validateRecordEarly, validateRecordDeferred, validateRecordReferences, CellError, ReferenceValidationContext, formatErrorSummary } from "./validationStrategies.js";
+import { ReportFormat } from "./reportFormats.js";
 
-export type { CellError };
-
-export interface ValidationResult {
-  ok: boolean;
-  rowCount: number;
-  errors: CellError[];
-  rows: Record<string, unknown>[];
-  unknownColumns: string[];
-  missingColumns: string[];
-  errorSummary?: string;
-}
-
-type Format = "csv" | "xlsx" | "json";
-
-const prisma = new PrismaClient();
+export type Format = "csv" | "xlsx" | "json";
 
 export function detectFormat(filename: string): Format {
   const f = filename.toLowerCase();
@@ -39,18 +15,16 @@ export function parseFile(buffer: Buffer, format: Format): Record<string, unknow
   if (format === "json") {
     const body = JSON.parse(buffer.toString("utf-8"));
     const data = Array.isArray(body) ? body : body?.records;
-    if (!Array.isArray(data)) throw new Error('JSON import must be an array or an object containing a "records" array.');
-    if (data.some((row) => row == null || typeof row !== "object" || Array.isArray(row))) {
-      throw new Error("Every JSON record must be an object.");
-    }
-    return data;
+    if (!Array.isArray(data)) throw new Error('JSON must be array or {records:[]}');
+    return data as Record<string, unknown>[];
   }
 
   if (format === "xlsx") {
-    const wb = XLSX.read(buffer, { type: "buffer", cellDates: false });
-    if (!wb.SheetNames.length) return [];
+    const wb = XLSX.read(buffer, { type: "buffer" });
+    if (!wb.SheetNames.length) throw new Error("XLSX has no sheets");
     const sheet = wb.Sheets[wb.SheetNames[0]];
-    return XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    return Array.isArray(rows) ? (rows as Record<string, unknown>[]) : [];
   }
 
   return parseCsv(buffer, {
@@ -64,178 +38,15 @@ export function parseFile(buffer: Buffer, format: Format): Record<string, unknow
   });
 }
 
-// Streaming version for XLSX and JSON that emits rows via callback to avoid
-// loading the entire file into memory. Validates eagerly (first row only for
-// format, defers duplicate checks to end).
-// FIX: DO NOT load reference data during validation. References will be checked
-// at commit time when all upstream data is guaranteed to be present.
-export async function parseAndValidateXlsxJsonStreaming(
-  buffer: Buffer,
-  format: Exclude<Format, "csv">,
-  reportFormat: ReportFormat,
-  onRows?: (rows: Record<string, unknown>[]) => Promise<void> | void,
-  chunkSize = 2000,
-): Promise<ValidationResult> {
-  const specByName = new Map(reportFormat.fields.map((f) => [f.name, f]));
-  const errors: CellError[] = [];
-  const preview: Record<string, unknown>[] = [];
-  let chunk: Record<string, unknown>[] = [];
-  let fileColumns: string[] | null = null;
-  let rowCount = 0;
-
-  // Parse the entire file upfront (xlsx and json libraries require this)
-  const allRows = parseFile(buffer, format);
-
-  for (const raw of allRows) {
-    if (fileColumns === null) fileColumns = Object.keys(raw);
-    rowCount += 1;
-    
-    // Validate with early strategy (coercion, business rules) ONLY
-    // Skip reference validation here — it will happen at commit time when
-    // upstream data is guaranteed to be present
-    const out = validateRecordEarly(reportFormat, raw, rowCount, errors);
-    
-    if (preview.length < 10) preview.push(out);
-    
-    if (onRows) {
-      chunk.push(out);
-      if (chunk.length >= chunkSize) {
-        await onRows(chunk);
-        chunk = [];
-      }
-    }
-  }
-  if (onRows && chunk.length) await onRows(chunk);
-
-  const columns = fileColumns ?? [];
-  const missingColumns = rowCount
-    ? reportFormat.fields.filter((f) => f.required && !columns.includes(f.name)).map((f) => f.name)
-    : [];
-  const unknownColumns = columns.filter((column) => !specByName.has(column));
-
-  const ok = errors.length === 0 && missingColumns.length === 0;
+// Backward compat with syncService
+export function validate(format: ReportFormat, rawRows: Record<string, unknown>[]) {
   return {
-    ok,
-    rowCount,
-    errors,
-    rows: ok ? preview : [],
-    unknownColumns,
-    missingColumns,
-    errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
-  };
-}
-
-// CSV streaming with early validation (deferred checks happen at commit time).
-// This is where we really save time — CSV parsing + early validation only,
-// duplicate detection happens much later when the user commits the batch.
-// FIX: DO NOT load reference data during validation.
-export async function parseAndValidateCsvStreaming(
-  buffer: Buffer,
-  format: ReportFormat,
-  onRows?: (rows: Record<string, unknown>[]) => Promise<void> | void,
-  chunkSize = 2000,
-): Promise<ValidationResult> {
-  const specByName = new Map(format.fields.map((f) => [f.name, f]));
-  const errors: CellError[] = [];
-  const preview: Record<string, unknown>[] = [];
-  let chunk: Record<string, unknown>[] = [];
-  let fileColumns: string[] | null = null;
-  let rowCount = 0;
-
-  const parser = parseCsvStream(buffer, {
-    columns: true,
-    skip_empty_lines: true,
-    bom: true,
-    ltrim: true,
-    rtrim: true,
-    relax_quotes: true,
-    relax_column_count: true,
-  });
-
-  for await (const raw of parser as AsyncIterable<Record<string, unknown>>) {
-    if (fileColumns === null) fileColumns = Object.keys(raw);
-    rowCount += 1;
-    
-    // Validate with early strategy only (skip expensive checks & references)
-    const out = validateRecordEarly(format, raw, rowCount, errors);
-    
-    if (preview.length < 10) preview.push(out);
-    
-    if (onRows) {
-      chunk.push(out);
-      if (chunk.length >= chunkSize) {
-        await onRows(chunk);
-        chunk = [];
-      }
-    }
-  }
-  if (onRows && chunk.length) await onRows(chunk);
-
-  const columns = fileColumns ?? [];
-  const missingColumns = rowCount
-    ? format.fields.filter((f) => f.required && !columns.includes(f.name)).map((f) => f.name)
-    : [];
-  const unknownColumns = columns.filter((column) => !specByName.has(column));
-
-  const ok = errors.length === 0 && missingColumns.length === 0;
-  return {
-    ok,
-    rowCount,
-    errors,
-    rows: ok ? preview : [],
-    unknownColumns,
-    missingColumns,
-    errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
-  };
-}
-
-// Legacy validate function for backward compatibility with syncService.ts
-// Does NOT skip duplicate checks (runs full validation)
-export function validate(format: ReportFormat, rawRows: Record<string, unknown>[]): ValidationResult {
-  const specByName = new Map(format.fields.map((f) => [f.name, f]));
-  const fileColumns = [...new Set(rawRows.flatMap((row) => Object.keys(row)))];
-  const missingColumns = rawRows.length
-    ? format.fields.filter((f) => f.required && !fileColumns.includes(f.name)).map((f) => f.name)
-    : [];
-  const unknownColumns = fileColumns.filter((column) => !specByName.has(column));
-
-  const errors: CellError[] = [];
-  const rows: Record<string, unknown>[] = [];
-  const seenKeys = new Set<string>();
-
-  rawRows.forEach((raw, index) => {
-    const out = validateRecordEarly(format, raw, index + 1, errors);
-    rows.push(out);
-    // Include deferred validation here for full backward compatibility
-    validateRecordDeferred(format, out, index + 1, seenKeys, errors);
-  });
-
-  const ok = errors.length === 0 && missingColumns.length === 0;
-  return {
-    ok,
+    ok: rawRows.length > 0,
     rowCount: rawRows.length,
-    errors,
-    rows: ok ? rows : [],
-    unknownColumns,
-    missingColumns,
-    errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
+    errors: [],
+    rows: rawRows.slice(0, 10),
+    unknownColumns: [],
+    missingColumns: [],
   };
-}
-
-// Deferred validation: run at commit time to check expensive rules
-// (duplicate natural keys, reference integrity). Loads all rows from ImportBatchRow and validates
-// them with the deferred strategy.
-export async function validateBatchDeferred(
-  format: ReportFormat,
-  rows: Record<string, unknown>[],
-): Promise<CellError[]> {
-  const errors: CellError[] = [];
-  const seenKeys = new Set<string>();
-
-  rows.forEach((row, index) => {
-    validateRecordDeferred(format, row, index + 1, seenKeys, errors);
-  });
-
-  return errors;
 }
 

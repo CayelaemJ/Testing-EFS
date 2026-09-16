@@ -15,7 +15,7 @@
 // Usage:  npx tsx scripts/rebuild-score-snapshots.ts
 // (safe to re-run: snapshotEmployer() upserts on the employerId+period key)
 
-import { prisma, snapshotEmployer } from "../src/services/snapshotBuilder.js";
+import { prisma, snapshotEmployer } from "./snapshotBuilder.js";
 
 async function main() {
   const rows = await prisma.scoreSnapshot.findMany({

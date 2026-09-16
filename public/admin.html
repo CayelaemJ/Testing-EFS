@@ -1202,13 +1202,24 @@ function renderResult(res){
       <div class="row section-gap">
         <button class="btn btn-green" onclick="commit('${res.batchId}')">Commit & recompute scores</button>
       </div>`;
-  } else {
-    const rows = res.errors.map(e=>`<tr><td>row ${e.row}</td><td>${e.column}</td><td><code>${e.value??''}</code></td><td>${e.reason}</td></tr>`).join('');
-    const missing = res.missingColumns.length ? `<div class="muted" style="margin-top:8px;">Missing required columns: <code>${res.missingColumns.join(', ')}</code></div>`:'';
+  } else if(res.status === 'ERROR'){
+    const summary = res.errorSummary || 'Upload failed with errors';
+    const rows = (res.errors||[]).slice(0, 50).map(e=>`<tr><td style="color:var(--red)">${e.row}</td><td>${e.column}</td><td><code>${String(e.value||'').substring(0,60)}</code></td><td>${e.reason}</td></tr>`).join('');
+    const missing = res.missingColumns?.length ? `<div class="muted" style="margin-top:8px;">Missing required columns: <code>${res.missingColumns.join(', ')}</code></div>` : '';
+    const table = rows ? `<div class="err-list" style="margin-top:12px;"><table><thead><tr><th>Row</th><th>Column</th><th>Value</th><th>Problem</th></tr></thead><tbody>${rows}</tbody></table></div>` : '';
     $('#result').innerHTML = `
-      <div class="banner err">✕ ${res.errorCount} problem(s) found across ${res.rowCount} rows. Nothing was loaded. Fix the file and re-upload.</div>
+      <div class="banner err">✕ ${summary}</div>
       ${missing}
-      <div class="err-list"><table><thead><tr><th>Row</th><th>Column</th><th>Value</th><th>Problem</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      ${table}`;
+  } else {
+    const rows = res.errors.map(e=>`<tr><td style="color:var(--red)">${e.row}</td><td>${e.column}</td><td><code>${String(e.value||'').substring(0,60)}</code></td><td>${e.reason}</td></tr>`).join('');
+    const missing = res.missingColumns.length ? `<div class="muted" style="margin-top:8px;">Missing required columns: <code>${res.missingColumns.join(', ')}</code></div>` : '';
+    const unknown = res.unknownColumns?.length ? `<div class="muted" style="margin-top:8px;">Unknown columns (ignored): <code>${res.unknownColumns.join(', ')}</code></div>` : '';
+    $('#result').innerHTML = `
+      <div class="banner err">✕ ${res.errorCount||res.errors?.length||0} problem(s) found. Nothing was loaded. Fix the file and re-upload.</div>
+      ${missing}
+      ${unknown}
+      <div class="err-list" style="margin-top:12px;"><table><thead><tr><th>Row</th><th>Column</th><th>Value</th><th>Problem</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
 }
 

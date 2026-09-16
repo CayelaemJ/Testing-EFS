@@ -8,8 +8,9 @@
 import * as XLSX from "xlsx";
 import { parse as parseCsv } from "csv-parse/sync";
 import { parse as parseCsvStream } from "csv-parse";
+import { PrismaClient } from "@prisma/client";
 import { ReportFormat, FieldSpec } from "./reportFormats.js";
-import { validateRecordEarly, validateRecordDeferred, CellError } from "./validationStrategies.js";
+import { validateRecordEarly, validateRecordDeferred, validateRecordReferences, CellError, ReferenceValidationContext, formatErrorSummary } from "./validationStrategies.js";
 
 export type { CellError };
 
@@ -20,9 +21,12 @@ export interface ValidationResult {
   rows: Record<string, unknown>[];
   unknownColumns: string[];
   missingColumns: string[];
+  errorSummary?: string;
 }
 
 type Format = "csv" | "xlsx" | "json";
+
+const prisma = new PrismaClient();
 
 export function detectFormat(filename: string): Format {
   const f = filename.toLowerCase();
@@ -60,6 +64,25 @@ export function parseFile(buffer: Buffer, format: Format): Record<string, unknow
   });
 }
 
+// Load reference data from database for validation
+async function loadPlatformUserReferences(): Promise<Map<string, boolean>> {
+  try {
+    const platformUsers = await prisma.platformUser.findMany({
+      select: { employee: { select: { employerId: true, payrollRef: true } } },
+    });
+    
+    const refMap = new Map<string, boolean>();
+    for (const pu of platformUsers) {
+      const key = `${pu.employee.employerId}|${pu.employee.payrollRef}`;
+      refMap.set(key, true);
+    }
+    return refMap;
+  } catch (e) {
+    console.error("Failed to load platform user references:", e);
+    return new Map();
+  }
+}
+
 // Streaming version for XLSX and JSON that emits rows via callback to avoid
 // loading the entire file into memory. Validates eagerly (first row only for
 // format, defers duplicate checks to end).
@@ -77,6 +100,12 @@ export async function parseAndValidateXlsxJsonStreaming(
   let fileColumns: string[] | null = null;
   let rowCount = 0;
 
+  // Load platform user references once if validating a dependent record type
+  const context: ReferenceValidationContext = {};
+  if (["debt_accounts", "policies", "journeys"].includes(reportFormat.key)) {
+    context.platformUserRefMap = await loadPlatformUserReferences();
+  }
+
   // Parse the entire file upfront (xlsx and json libraries require this)
   const allRows = parseFile(buffer, format);
 
@@ -86,6 +115,12 @@ export async function parseAndValidateXlsxJsonStreaming(
     
     // Validate with early strategy (coercion, business rules)
     const out = validateRecordEarly(reportFormat, raw, rowCount, errors);
+    
+    // Check references early for dependent records
+    if (context.platformUserRefMap && ["debt_accounts", "policies", "journeys"].includes(reportFormat.key)) {
+      validateRecordReferences(reportFormat, out, rowCount, context, errors);
+    }
+    
     if (preview.length < 10) preview.push(out);
     
     if (onRows) {
@@ -112,6 +147,7 @@ export async function parseAndValidateXlsxJsonStreaming(
     rows: ok ? preview : [],
     unknownColumns,
     missingColumns,
+    errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
   };
 }
 
@@ -131,6 +167,12 @@ export async function parseAndValidateCsvStreaming(
   let fileColumns: string[] | null = null;
   let rowCount = 0;
 
+  // Load platform user references once if validating a dependent record type
+  const context: ReferenceValidationContext = {};
+  if (["debt_accounts", "policies", "journeys"].includes(format.key)) {
+    context.platformUserRefMap = await loadPlatformUserReferences();
+  }
+
   const parser = parseCsvStream(buffer, {
     columns: true,
     skip_empty_lines: true,
@@ -147,6 +189,12 @@ export async function parseAndValidateCsvStreaming(
     
     // Validate with early strategy only (skip expensive duplicate checks)
     const out = validateRecordEarly(format, raw, rowCount, errors);
+    
+    // Check references early for dependent records
+    if (context.platformUserRefMap && ["debt_accounts", "policies", "journeys"].includes(format.key)) {
+      validateRecordReferences(format, out, rowCount, context, errors);
+    }
+    
     if (preview.length < 10) preview.push(out);
     
     if (onRows) {
@@ -173,6 +221,7 @@ export async function parseAndValidateCsvStreaming(
     rows: ok ? preview : [],
     unknownColumns,
     missingColumns,
+    errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
   };
 }
 
@@ -205,6 +254,7 @@ export function validate(format: ReportFormat, rawRows: Record<string, unknown>[
     rows: ok ? rows : [],
     unknownColumns,
     missingColumns,
+    errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
   };
 }
 

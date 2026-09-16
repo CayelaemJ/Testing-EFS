@@ -7,7 +7,9 @@
 import * as XLSX from "xlsx";
 import { parse as parseCsv } from "csv-parse/sync";
 import { parse as parseCsvStream } from "csv-parse";
-import { validateRecordEarly, validateRecordDeferred } from "./validationStrategies.js";
+import { PrismaClient } from "@prisma/client";
+import { validateRecordEarly, validateRecordDeferred, validateRecordReferences, formatErrorSummary } from "./validationStrategies.js";
+const prisma = new PrismaClient();
 export function detectFormat(filename) {
     const f = filename.toLowerCase();
     if (f.endsWith(".xlsx") || f.endsWith(".xls"))
@@ -44,6 +46,24 @@ export function parseFile(buffer, format) {
         relax_column_count: true,
     });
 }
+// Load reference data from database for validation
+async function loadPlatformUserReferences() {
+    try {
+        const platformUsers = await prisma.platformUser.findMany({
+            select: { employee: { select: { employerId: true, payrollRef: true } } },
+        });
+        const refMap = new Map();
+        for (const pu of platformUsers) {
+            const key = `${pu.employee.employerId}|${pu.employee.payrollRef}`;
+            refMap.set(key, true);
+        }
+        return refMap;
+    }
+    catch (e) {
+        console.error("Failed to load platform user references:", e);
+        return new Map();
+    }
+}
 // Streaming version for XLSX and JSON that emits rows via callback to avoid
 // loading the entire file into memory. Validates eagerly (first row only for
 // format, defers duplicate checks to end).
@@ -54,6 +74,11 @@ export async function parseAndValidateXlsxJsonStreaming(buffer, format, reportFo
     let chunk = [];
     let fileColumns = null;
     let rowCount = 0;
+    // Load platform user references once if validating a dependent record type
+    const context = {};
+    if (["debt_accounts", "policies", "journeys"].includes(reportFormat.key)) {
+        context.platformUserRefMap = await loadPlatformUserReferences();
+    }
     // Parse the entire file upfront (xlsx and json libraries require this)
     const allRows = parseFile(buffer, format);
     for (const raw of allRows) {
@@ -62,6 +87,10 @@ export async function parseAndValidateXlsxJsonStreaming(buffer, format, reportFo
         rowCount += 1;
         // Validate with early strategy (coercion, business rules)
         const out = validateRecordEarly(reportFormat, raw, rowCount, errors);
+        // Check references early for dependent records
+        if (context.platformUserRefMap && ["debt_accounts", "policies", "journeys"].includes(reportFormat.key)) {
+            validateRecordReferences(reportFormat, out, rowCount, context, errors);
+        }
         if (preview.length < 10)
             preview.push(out);
         if (onRows) {
@@ -87,6 +116,7 @@ export async function parseAndValidateXlsxJsonStreaming(buffer, format, reportFo
         rows: ok ? preview : [],
         unknownColumns,
         missingColumns,
+        errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
     };
 }
 // CSV streaming with early validation (deferred checks happen at commit time).
@@ -99,6 +129,11 @@ export async function parseAndValidateCsvStreaming(buffer, format, onRows, chunk
     let chunk = [];
     let fileColumns = null;
     let rowCount = 0;
+    // Load platform user references once if validating a dependent record type
+    const context = {};
+    if (["debt_accounts", "policies", "journeys"].includes(format.key)) {
+        context.platformUserRefMap = await loadPlatformUserReferences();
+    }
     const parser = parseCsvStream(buffer, {
         columns: true,
         skip_empty_lines: true,
@@ -114,6 +149,10 @@ export async function parseAndValidateCsvStreaming(buffer, format, onRows, chunk
         rowCount += 1;
         // Validate with early strategy only (skip expensive duplicate checks)
         const out = validateRecordEarly(format, raw, rowCount, errors);
+        // Check references early for dependent records
+        if (context.platformUserRefMap && ["debt_accounts", "policies", "journeys"].includes(format.key)) {
+            validateRecordReferences(format, out, rowCount, context, errors);
+        }
         if (preview.length < 10)
             preview.push(out);
         if (onRows) {
@@ -139,6 +178,7 @@ export async function parseAndValidateCsvStreaming(buffer, format, onRows, chunk
         rows: ok ? preview : [],
         unknownColumns,
         missingColumns,
+        errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
     };
 }
 // Legacy validate function for backward compatibility with syncService.ts
@@ -167,6 +207,7 @@ export function validate(format, rawRows) {
         rows: ok ? rows : [],
         unknownColumns,
         missingColumns,
+        errorSummary: ok ? undefined : formatErrorSummary(errors, missingColumns, unknownColumns),
     };
 }
 // Deferred validation: run at commit time to check expensive rules

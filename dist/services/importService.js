@@ -126,7 +126,7 @@ async function commitRowsChunk(tx, reportKey, rows, stats, batchId) {
                 .map((row) => `${String(row.employer_ref)}|${String(row.payroll_ref)}`))];
         if (!keys.length)
             return { employeeIds: new Map(), platformUserIds: new Map() };
-        const employees = await tx.employee.findMany({
+        const employees = await prisma.employee.findMany({
             where: {
                 OR: keys.map((key) => {
                     const split = key.indexOf("|");

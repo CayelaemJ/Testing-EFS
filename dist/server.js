@@ -5,6 +5,7 @@
 //  fetch() calls — no re-shaping needed.
 // ════════════════════════════════════════════════════════════════════
 import Fastify from "fastify";
+import { Prisma } from "@prisma/client";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import cookie from "@fastify/cookie";
@@ -12,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { prisma, snapshotEmployer, getDashboardPayload } from "./services/snapshotBuilder.js";
+import { prisma, snapshotEmployer, getDashboardPayload, monthKey } from "./services/snapshotBuilder.js";
 import { REPORT_FORMATS, LOAD_ORDER, getFormat } from "./services/reportFormats.js";
 import { csvTemplate, xlsxTemplate, formatManifest } from "./services/templateGenerator.js";
 import { revertBatch, resetAllData } from "./services/importService.js";
@@ -530,7 +531,13 @@ app.get("/api/admin/reports/:key/template", async (req, reply) => {
     reply.header("Content-Disposition", `attachment; filename="${format.key}_template.csv"`);
     return reply.send(csvTemplate(format));
 });
-// upload a report file -> parse + validate + commit in the background
+// upload a report file -> parse + validate -> staged batch (NOT yet live)
+// Returns 202 immediately and validates in the background; the browser
+// polls /api/admin/upload-jobs/:jobId (admin.html already does this — the
+// route just needs to exist). Parsing/validating a large CSV/XLSX is CPU
+// and DB work that can run for a while; doing it inline on the request
+// blocked the whole HTTP connection (and the rest of the server) until it
+// finished, which is what made uploads feel like they were hanging.
 app.post("/api/admin/reports/:key/upload", async (req, reply) => {
     if (!(await requireAdmin(req, reply)))
         return;
@@ -617,7 +624,6 @@ app.get("/api/admin/batches/:batchId/download", async (req, reply) => {
         return reply.code(404).send({ error: e?.message || "uploaded data is no longer available" });
     }
 });
-
 // import history
 app.get("/api/admin/batches", async (req, reply) => {
     if (!(await requireAdmin(req, reply)))
@@ -898,17 +904,51 @@ app.get("/api/employers/:employerId/periods", async (req, reply) => {
     // month. With 100k employees that creates a huge N+1 workload before the
     // user has even opened the month selector.
     //
-    // Persisted monthly scores are the fast path. Cohort-specific scores are
-    // calculated only when Region/Income is actually selected, and those calls
-    // are protected by the dashboard cache.
+    // Persisted monthly scores are the fast path. Region/Income is applied by
+    // the dashboard request after a period is selected; the period picker must
+    // never calculate twelve full cohort dashboards.
     const employerId = req.params.employerId;
-    const hasCohortFilter = Boolean(req.query.site && req.query.site !== "all") || Boolean(req.query.income && req.query.income !== "all");
+    // The picker is deliberately a fixed rolling window: twelve months of
+    // actual employer data, newest first. Do not expose every historical row
+    // and do not calculate the dashboard twelve times just to build a menu
+    // as a dimension selector, not a dashboard calculator.
     const snapshots = await prisma.scoreSnapshot.findMany({
         where: { employerId, payloadVersion: { gte: 4 } },
-        select: { period: true, optimiseScore: true },
+        select: {
+            period: true,
+            optimiseScore: true,
+            rawScore: true,
+            engagementScore: true,
+            cashflowScore: true,
+            debtRiskScore: true,
+            insuranceScore: true,
+            engagementWeight: true,
+            cashflowWeight: true,
+            debtRiskWeight: true,
+            insuranceWeight: true,
+        },
         orderBy: { period: "desc" },
     });
     const periodSet = new Set(snapshots.map((s) => s.period));
+    // ScoreSnapshot is the preferred source for labelled scores, but it is not
+    // guaranteed to exist for every month covered by imported workforce data.
+    // Build the period dimension from the immutable EmployeeVersion observation
+    // table as well. PostgreSQL does the DISTINCT/month extraction; never pull
+    // 100k employee rows into Node just to populate a selector.
+    const observedPeriods = await prisma.$queryRaw(Prisma.sql `
+      SELECT DISTINCT to_char(date_trunc('month', ev."observedAt"), 'YYYY-MM') AS period
+      FROM "EmployeeVersion" ev
+      INNER JOIN "Employee" e ON e.id = ev."employeeId"
+      WHERE e."employerId" = ${employerId}
+        AND e."sourceDeletedAt" IS NULL
+        AND ev."isDeleted" = false
+      ORDER BY period DESC
+      LIMIT 24
+    `);
+    for (const row of observedPeriods) {
+        if (row?.period)
+            periodSet.add(row.period);
+    }
     const latestEmployee = await prisma.employee.findFirst({
         where: { employerId, sourceDeletedAt: null },
         select: { observedAt: true },
@@ -916,29 +956,61 @@ app.get("/api/employers/:employerId/periods", async (req, reply) => {
     });
     if (latestEmployee?.observedAt)
         periodSet.add(monthKey(latestEmployee.observedAt));
-    const periods = [];
-    for (const period of [...periodSet].sort().reverse()) {
-        const snap = snapshots.find((row) => row.period === period);
-        if (!hasCohortFilter && snap) {
-            periods.push({ period, optimiseScore: snap.optimiseScore == null ? null : Number(snap.optimiseScore) });
-            continue;
-        }
-        try {
-            const live = await getDashboardPayload(employerId, {
-                period,
-                site: req.query.site,
-                income: req.query.income,
-            });
-            periods.push({
-                period,
-                optimiseScore: live?.wellness?.complete && live?.wellness?.score != null ? Number(live.wellness.score) : null,
-            });
-        }
-        catch {
-            periods.push({ period, optimiseScore: null });
-        }
+    // Return at most the latest 12 real reporting months. Keep the selector
+    // cheap: only the indexed observation dimension and persisted snapshots are
+    // touched; never invoke getDashboardPayload from this endpoint.
+    const latestPeriods = [...periodSet].sort().reverse().slice(0, 12);
+    const snapshotByPeriod = new Map(snapshots.map((row) => [row.period, row]));
+    const snapshotScore = (snap) => {
+        if (!snap)
+            return null;
+        const stored = Number(snap.optimiseScore);
+        // Older/broken snapshots have occasionally contained a zero headline
+        // while the four driver scores were populated. Rebuild the headline
+        // from the persisted driver scores instead of exposing a false 0.
+        const drivers = [
+            [Number(snap.engagementScore), Number(snap.engagementWeight)],
+            [Number(snap.cashflowScore), Number(snap.cashflowWeight)],
+            [Number(snap.debtRiskScore), Number(snap.debtRiskWeight)],
+            [Number(snap.insuranceScore), Number(snap.insuranceWeight)],
+        ];
+        const weighted = drivers.every(([score, weight]) => Number.isFinite(score) && Number.isFinite(weight) && weight > 0)
+            ? Math.round(drivers.reduce((sum, [score, weight]) => sum + score * weight, 0))
+            : null;
+        if (stored > 0 && stored <= 100)
+            return Math.round(stored);
+        if (weighted != null && weighted >= 0 && weighted <= 100)
+            return weighted;
+        const raw = Number(snap.rawScore);
+        return Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : null;
+    };
+    const results = latestPeriods.map(period => {
+        const snap = snapshotByPeriod.get(period);
+        return { period, optimiseScore: snapshotScore(snap) };
+    });
+    // Most months already have a usable persisted snapshot (the fast path
+    // above). But a period can legitimately have none yet — data just
+    // imported for it, the snapshot job hasn't run, or the row is stuck at
+    // an old payloadVersion until scripts/rebuild-score-snapshots.ts is
+    // re-run — and in that case the picker was showing "Score unavailable"
+    // forever instead of a number. Rather than silently leaving those
+    // periods blank, compute the handful that are missing on demand — this
+    // reuses the same cached dashboard-payload path getDashboardPayload
+    // already uses everywhere else, so it's cheap after the first request
+    // and never touches the months that already resolved above.
+    const missing = results.filter(r => r.optimiseScore == null);
+    if (missing.length) {
+        await Promise.all(missing.map(async (r) => {
+            try {
+                const live = await getDashboardPayload(employerId, { period: r.period });
+                if (live?.wellness?.complete && live?.wellness?.score != null) {
+                    r.optimiseScore = Math.round(Number(live.wellness.score));
+                }
+            }
+            catch { /* leave unavailable — the picker still shows the period itself */ }
+        }));
     }
-    return periods;
+    return results;
 });
 // ── score history (movement chart) — scoped ──
 app.get("/api/employers/:employerId/score-history", async (req, reply) => {
@@ -1062,7 +1134,7 @@ function startAutomationScheduler(app) {
     setInterval(tick, CHECK_MS);
     setTimeout(tick, 45000);
 }
-// ── scheduled-report checker: claims due jobs in the database and sends them via SMTP ──
+// ── scheduled-report checker: claims due jobs in the database and sends them via SMTP, we do need to make sure that this can be altered to schema changes ──
 function startReportScheduler(app) {
     const CHECK_MS = 60 * 1000;
     const tick = async () => {
@@ -1076,7 +1148,7 @@ function startReportScheduler(app) {
     setInterval(tick, CHECK_MS);
     setTimeout(tick, 20000);
 }
-// ── portfolio view: same dated calculation model as each employer dashboard ──
+// ── portfolio view: same dated calculation model as each employer dashboard only execs and people can see this ──
 app.get("/api/portfolio", async (req, reply) => {
     const user = await requireUser(req, reply);
     if (!user)

@@ -14,6 +14,11 @@ export interface CellError {
   reason: string;
 }
 
+export interface ReferenceValidationContext {
+  employeeRefMap?: Map<string, boolean>;
+  platformUserRefMap?: Map<string, boolean>;
+}
+
 function parseDateOnly(value: string): Date | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
   const [year, month, day] = value.split("-").map(Number);
@@ -170,14 +175,81 @@ export function validateRecordDeferred(
     ).join("∣");
     
     if (seenKeys.has(keyValue)) {
+      const keyDesc = format.naturalKey.length === 1 
+        ? `${format.naturalKey[0]} = ${keyValue}`
+        : `(${format.naturalKey.join(" + ")}) = ${keyValue}`;
       errors.push({
         row: rowNo,
         column: format.naturalKey.join("+"),
         value: keyValue,
-        reason: "duplicate natural key in file",
+        reason: `duplicate record — another row already has ${keyDesc}`,
       });
     }
     seenKeys.add(keyValue);
   }
+}
+
+// Reference validation: check that dependent records exist
+// Used for debt_accounts, policies, journeys that reference platform_users
+export function validateRecordReferences(
+  format: ReportFormat,
+  row: Record<string, unknown>,
+  rowNo: number,
+  context: ReferenceValidationContext,
+  errors: CellError[],
+) {
+  // debt_accounts, policies, journeys require an existing platform_user reference
+  if (["debt_accounts", "policies", "journeys"].includes(format.key)) {
+    const employerRef = row.employer_ref;
+    const payrollRef = row.payroll_ref;
+    
+    if (employerRef && payrollRef) {
+      const refKey = `${String(employerRef)}|${String(payrollRef)}`;
+      const exists = context.platformUserRefMap?.get(refKey);
+      
+      if (exists === false) {
+        errors.push({
+          row: rowNo,
+          column: "employer_ref + payroll_ref",
+          value: refKey,
+          reason: `references a platform user that doesn't exist. Check that a matching platform_users record (employer_ref=${employerRef}, payroll_ref=${payrollRef}) has already been uploaded.`,
+        });
+      }
+    }
+  }
+}
+
+// Format error for user display: show row, column, value, and reason
+export function formatCellError(err: CellError): string {
+  const display = err.value === null || err.value === undefined 
+    ? "(empty)" 
+    : String(err.value).substring(0, 100);
+  return `Row ${err.row}, column "${err.column}": ${err.reason}\n(value: ${display})`;
+}
+
+// Summary of all errors for upload job response
+export function formatErrorSummary(errors: CellError[], missingColumns: string[], unknownColumns: string[]): string {
+  const lines: string[] = [];
+  
+  if (errors.length > 0) {
+    lines.push(`${errors.length} validation error${errors.length === 1 ? "" : "s"}:`);
+    // Show first 5 errors in detail, then count
+    errors.slice(0, 5).forEach(err => {
+      lines.push(`  • ${formatCellError(err).split("\n")[0]}`);
+    });
+    if (errors.length > 5) {
+      lines.push(`  ... and ${errors.length - 5} more errors`);
+    }
+  }
+  
+  if (missingColumns.length > 0) {
+    lines.push(`\nMissing required columns: ${missingColumns.join(", ")}`);
+  }
+  
+  if (unknownColumns.length > 0) {
+    lines.push(`\nUnknown columns (will be ignored): ${unknownColumns.join(", ")}`);
+  }
+  
+  return lines.join("\n");
 }
 

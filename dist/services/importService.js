@@ -650,7 +650,6 @@ export async function commitBatch(batchId, options = {}) {
             }
         });
     }
-
     await prisma.importBatch.update({
         where: { id: batchId },
         data: {

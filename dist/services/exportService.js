@@ -1,8 +1,6 @@
 // ════════════════════════════════════════════════════════════════════
 //  ADMIN DATA EXPORT — CSV
 //  Simple, dependency-free CSV building (no xlsx tooling needed here).
-//  Added this because sometimes we might want to see the data, that have we have loaded in the app This will help us so much
-//  In regards to detecting anomalies, loading data into python for exploratory analysis
 // ════════════════════════════════════════════════════════════════════
 import { prisma } from "./authService.js";
 import { getFormat } from "./reportFormats.js";
@@ -75,8 +73,10 @@ export async function exportUsersCsv() {
     });
     return toCsv(rows, ["id", "email", "name", "role", "active", "partnerId", "createdAt", "revokedAt", "revokedReason", "revokedBy"]);
 }
-
-
+/** Export the exact canonical rows staged by an uploaded import batch.
+ * This is intentionally the uploaded feed, not a transformed projection from
+ * the live tables, so admins can download exactly what was imported.
+ */
 export async function exportImportBatchCsv(batchId) {
     const batch = await prisma.importBatch.findUnique({
         where: { id: batchId },
@@ -92,6 +92,6 @@ export async function exportImportBatchCsv(batchId) {
     if (!rows.length)
         throw new Error("no uploaded rows are available for this batch");
     const format = getFormat(batch.reportKey);
-    const keys = format?.fields.map((f) => f.name) ?? Object.keys(rows[0].data ?? {});
+    const keys = format?.fields.map((f) => f.name) ?? Object.keys((rows[0].data ?? {}));
     return toCsv(rows.map((r) => r.data), keys);
 }

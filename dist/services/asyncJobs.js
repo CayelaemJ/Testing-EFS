@@ -36,7 +36,9 @@ export function startUploadJob(opts) {
                 };
                 return;
             }
-            // Successful validation is immediately committed in the same background job.
+            // Import means import: once validation succeeds, commit immediately in
+            // the same background job. The HTTP request has already returned 202, so
+            // this expensive DB work never blocks the admin UI.
             const commit = await commitBatch(batch.id);
             job.status = "DONE";
             job.result = {

@@ -1,0 +1,3 @@
+employer_ref,payroll_ref,observed_at,site_name,active,eligible_from,eligible_to,income_band,source_updated_at,is_deleted
+TSW,EMP-TSW-1204,2026-01-31,,True,2026-01-31,,BAND_5_10K,2026-12-31T08:00:00Z,False
+

@@ -64,8 +64,8 @@ export function startUploadJob(opts: any) {
         errors: [],
         errorCount: 0,
         errorSummary: "",
-        period: currentPeriod(),
         ...commit,
+        period: currentPeriod(),
       };
     } catch (e) {
       // Even on exception, mark DONE with error status so frontend can display it

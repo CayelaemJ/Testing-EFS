@@ -626,7 +626,15 @@ async function syncNow(){
   $('#integ-result').innerHTML = `<div class="banner ok">Syncing all reports from ${mode}… this may take a minute for large datasets.</div>`;
   try{
     const r = await fetch(`${API}/api/admin/integration/sync`,{method:'POST'});
-    const d = await r.json();
+    let d = await r.json();
+    if(!r.ok || d.error){ $('#integ-result').innerHTML = `<div class="banner err">✕ ${d.error || `server error ${r.status}`}</div>`; return; }
+
+    // Sync is accepted immediately and runs in the background; poll for
+    // the result instead of waiting on the original request.
+    if(r.status === 202 && d.jobId){
+      d = await pollSyncJob(d.jobId);
+    }
+
     if(d.error){ $('#integ-result').innerHTML = `<div class="banner err">✕ ${d.error}</div>`; return; }
     const rows = Object.entries(d.summary||{}).map(([k,v])=>{
       const txt = v.error ? `<span style="color:#b5391f">${v.error}</span>` : v.errorCount ? `<span style="color:#b5391f">${v.errorCount} validation error(s)</span>` : `${v.committed ?? 0} loaded`;
@@ -636,6 +644,27 @@ async function syncNow(){
     $('#integ-result').innerHTML = `<div class="banner ${cls}">${d.status}: ${d.note}</div><table class="hist" style="margin-top:8px"><tbody>${rows}</tbody></table>`;
     loadInteg();
   }catch(e){ $('#integ-result').innerHTML = `<div class="banner err">✕ ${e.message}</div>`; }
+}
+async function pollSyncJob(jobId){
+  const started = Date.now();
+  let dots = 0;
+  const url = `${API}/api/admin/sync-jobs/${jobId}`;
+
+  while(Date.now() - started < 30 * 60 * 1000){
+    dots = (dots + 1) % 4;
+    $('#integ-result').innerHTML = `<div class="banner ok">Syncing${'.'.repeat(dots)} this may take a minute for large datasets. Keep this tab open.</div>`;
+
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    const r = await fetch(url, { cache: 'no-store' });
+    const d = await r.json().catch(() => null);
+
+    if(!r.ok || !d) throw new Error(d?.error || `Sync status check failed: HTTP ${r.status}`);
+    if(d.status === 'DONE') return d;
+    if(d.status === 'FAILED') throw new Error(d.error || 'Sync failed');
+  }
+
+  throw new Error('Sync is still running after 30 minutes. Check sync history before retrying.');
 }
 async function loadIntegLogs(){
   try{

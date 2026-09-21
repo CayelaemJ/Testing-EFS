@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import type { ServerResponse } from "node:http";
 import { prisma, snapshotEmployer, getDashboardPayload, monthKey } from "./services/snapshotBuilder.js";
 import { REPORT_FORMATS, LOAD_ORDER, getFormat } from "./services/reportFormats.js";
 import { csvTemplate, xlsxTemplate, formatManifest } from "./services/templateGenerator.js";
@@ -158,7 +159,7 @@ app.register(fastifyStatic, {
   // The portal HTML is deployed independently of browser cache state. UI assets
   // are intentionally no-store while the product is pre-live so a deployment
   // cannot appear to retain an older navigation/integration screen.
-  setHeaders(res, filePath) {
+  setHeaders(res: ServerResponse, filePath) {
     if (/\.(?:js|css|html)$/i.test(filePath)) {
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
       res.setHeader("Pragma", "no-cache");

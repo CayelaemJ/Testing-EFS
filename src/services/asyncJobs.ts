@@ -22,6 +22,11 @@ function startJob(map: Map<string, any>) {
   return id;
 }
 
+function currentPeriod(): string {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
 export function startUploadJob(opts: any) {
   const jobId = startJob(uploadJobs);
   const job = uploadJobs.get(jobId);
@@ -41,7 +46,7 @@ export function startUploadJob(opts: any) {
         errorSummary: "",
         missingColumns: result.missingColumns,
         unknownColumns: result.unknownColumns,
-        preview: result.rows.slice(0, 10),
+        preview: result.rows.slice(0, 3),
       };
 
       // If validation failed, don't auto-commit
@@ -59,6 +64,7 @@ export function startUploadJob(opts: any) {
         errors: [],
         errorCount: 0,
         errorSummary: "",
+        period: currentPeriod(),
         ...commit,
       };
     } catch (e) {
@@ -94,7 +100,7 @@ export function startCommitJob(batchId: string) {
     try {
       const result = await commitBatch(batchId);
       job.status = "DONE";
-      job.result = result;
+      job.result = { ...result, period: currentPeriod() };
     } catch (e) {
       job.status = "FAILED";
       job.error = (e as any)?.message || String(e);

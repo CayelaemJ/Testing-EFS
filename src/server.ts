@@ -18,7 +18,7 @@ import { prisma, snapshotEmployer, getDashboardPayload, monthKey } from "./servi
 import { REPORT_FORMATS, LOAD_ORDER, getFormat } from "./services/reportFormats.js";
 import { csvTemplate, xlsxTemplate, formatManifest } from "./services/templateGenerator.js";
 import { uploadAndValidate, commitBatch, revertBatch, resetAllData } from "./services/importService.js";
-import { startUploadJob, getUploadJob, startCommitJob, getCommitJob } from "./services/asyncJobs.js";
+import { startUploadJob, getUploadJob, startCommitJob, getCommitJob, startSyncJob, getSyncJob } from "./services/asyncJobs.js";
 import { getConfig as getSyncConfig, saveConfig as saveSyncConfig, publicConfig as publicSyncConfig, testConnection as testSyncConnection, runSync, recentSyncLogs } from "./services/syncService.js";
 import { listPartners, createPartner, updatePartner, deletePartner, assignUserToPartner, assignEmployerToPartner, themeForUser, themeForSlug } from "./services/partnerService.js";
 import { login, resolveSession, destroySession, canViewEmployer, canAccessModule, allowedEmployerIds, AuthUser } from "./services/authService.js";
@@ -681,10 +681,27 @@ app.post<{ Body: Record<string, unknown> }>("/api/admin/integration/test", async
   return testSyncConnection((req.body || {}) as any);
 });
 
+// Trigger an integration sync (API or SQL). Returns 202 immediately; the
+// browser polls /api/admin/sync-jobs/:jobId. Pulling and validating a full
+// dataset from an external source can take minutes, and doing it inline on
+// the request used to hang the HTTP connection until it finished.
 app.post("/api/admin/integration/sync", async (req, reply) => {
   if (!(await requireAdmin(req, reply))) return;
-  return runSync("manual");
+  const jobId = startSyncJob("manual");
+  return reply.code(202).send({ status: "ACCEPTED", jobId });
 });
+
+app.get<{ Params: { jobId: string } }>(
+  "/api/admin/sync-jobs/:jobId",
+  async (req, reply) => {
+    if (!(await requireAdmin(req, reply))) return;
+    const job = getSyncJob(req.params.jobId);
+    if (!job) return reply.code(404).send({ error: "unknown sync job" });
+    if (job.status === "PENDING") return { status: "PROCESSING" };
+    if (job.status === "FAILED") return { status: "FAILED", error: job.error };
+    return { status: "DONE", ...job.result };
+  },
+);
 
 app.get("/api/admin/integration/logs", async (req, reply) => {
   if (!(await requireAdmin(req, reply))) return;

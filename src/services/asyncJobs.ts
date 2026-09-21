@@ -7,10 +7,12 @@
 
 import { randomUUID } from "node:crypto";
 import { uploadAndValidate, commitBatch } from "./importService.js";
+import { runSync } from "./syncService.js";
 import { prisma } from "./snapshotBuilder.js";
 
 const uploadJobs = new Map<string, any>();
 const commitJobs = new Map<string, any>();
+const syncJobs = new Map<string, any>();
 
 // Jobs expire after 30 minutes so the maps don't grow forever.
 function startJob(map: Map<string, any>) {
@@ -105,5 +107,31 @@ export function startCommitJob(batchId: string) {
 
 export function getCommitJob(jobId: string) {
   return commitJobs.get(jobId);
+}
+
+// Integration syncs (API or SQL) can take minutes for large datasets.
+// Run them in the background and let the browser poll
+// /api/admin/sync-jobs/:jobId, same pattern as uploads/commits.
+export function startSyncJob(trigger: "manual" | "scheduled" = "manual") {
+  const jobId = startJob(syncJobs);
+  const job = syncJobs.get(jobId);
+
+  (async () => {
+    try {
+      const result = await runSync(trigger);
+      job.status = "DONE";
+      job.result = result;
+    } catch (e) {
+      job.status = "FAILED";
+      job.error = (e as any)?.message || String(e);
+      console.error("[sync-job] sync failed:", e);
+    }
+  })();
+
+  return jobId;
+}
+
+export function getSyncJob(jobId: string) {
+  return syncJobs.get(jobId);
 }
 

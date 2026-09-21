@@ -1,9 +1,9 @@
 // ════════════════════════════════════════════════════════════════════
-//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL (OPTIMIZED)
+//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL (ULTRA-OPTIMIZED)
 //
 //  Each report owns its cursor. A failed report never advances its cursor.
-//  Skips Node.js validation/transformation; uses SQL stored procedures
-//  for direct atomic upserts.
+//  SQL integrations use direct INSERT ... SELECT (zero parsing, zero loop).
+//  API integrations use bulk upsert stored procedures.
 // ════════════════════════════════════════════════════════════════════
 
 import { PrismaClient, Prisma } from "@prisma/client";
@@ -20,8 +20,22 @@ function overlapCursor(value?: Date | null): Date | null {
   return value ? new Date(value.getTime() - CURSOR_OVERLAP_MS) : null;
 }
 
-// Map report keys to their stored procedure names
-const SYNC_PROCS: Record<string, string> = {
+// Map report keys to their direct SQL sync procedure names
+const DIRECT_SQL_PROCS: Record<string, string> = {
+  employers: "sync_employers_direct",
+  employees: "sync_employees_direct",
+  platform_users: "sync_platform_users_direct",
+  journeys: "sync_journeys_direct",
+  debt_accounts: "sync_debt_accounts_direct",
+  policies: "sync_policies_direct",
+  ratings: "sync_ratings_direct",
+  referrals: "sync_referrals_direct",
+  salary_advances: "sync_salary_advances_direct",
+  workforce_snapshots: "sync_workforce_snapshots_direct",
+};
+
+// Map report keys to their JSONB upsert procedure names (for API)
+const JSONB_PROCS: Record<string, string> = {
   employers: "sync_upsert_employers",
   employees: "sync_upsert_employees",
   platform_users: "sync_upsert_platform_users",
@@ -114,6 +128,7 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
   let anyFailed = false;
   let anyOk = false;
   let adapter: Awaited<ReturnType<typeof createSourceAdapter>> | null = null;
+  const mode = configuredSourceMode(config);
 
   try {
     adapter = await createSourceAdapter(config);
@@ -156,23 +171,53 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           continue;
         }
 
-        // Call the stored procedure directly instead of validating/transforming
-        // in Node.js. The proc handles upsert atomically in a single SQL transaction.
-        const procName = SYNC_PROCS[reportKey];
-        if (!procName) {
-          throw new Error(`No sync procedure defined for ${reportKey}`);
+        let inserted: bigint = 0n;
+        let updated: bigint = 0n;
+
+        if (mode === "SQL") {
+          // SQL integration: Direct INSERT ... SELECT (fastest path)
+          // Zero JSONB parsing, zero row-by-row loops. Pure SQL.
+          const procName = DIRECT_SQL_PROCS[reportKey];
+          if (!procName) {
+            throw new Error(`No direct SQL sync procedure defined for ${reportKey}`);
+          }
+
+          // Call the procedure: it handles INSERT ... SELECT directly from source views
+          const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; updated: bigint }>>`
+            CALL ${Prisma.raw(procName)}(
+              ${config.sqlSchema || "public"},
+              ${config.sqlViewPrefix || "v_"},
+              ${requestSince},
+              ${throughAt}
+            )
+          `;
+
+          if (!procResult || procResult.length === 0) {
+            throw new Error(`${reportKey}: stored procedure returned no result`);
+          }
+
+          inserted = procResult[0].inserted;
+          updated = procResult[0].updated;
+        } else {
+          // API integration: Convert to JSONB and call upsert procedure
+          const procName = JSONB_PROCS[reportKey];
+          if (!procName) {
+            throw new Error(`No JSONB sync procedure defined for ${reportKey}`);
+          }
+
+          const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; updated: bigint; deleted: bigint }>>`
+            SELECT * FROM ${Prisma.raw(procName)}(${JSON.stringify(pulled.records)}::JSONB)
+          `;
+
+          if (!procResult || procResult.length === 0) {
+            throw new Error(`${reportKey}: stored procedure returned no result`);
+          }
+
+          inserted = procResult[0].inserted;
+          updated = procResult[0].updated;
         }
 
-        const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; updated: bigint; deleted: bigint }>>`
-          SELECT * FROM ${Prisma.raw(procName)}(${JSON.stringify(pulled.records)}::JSONB)
-        `;
-
-        if (!procResult || procResult.length === 0) {
-          throw new Error(`${reportKey}: stored procedure returned no result`);
-        }
-
-        const { inserted, updated, deleted } = procResult[0];
-        const committed = Number(inserted) + Number(updated);
+        const committed = BigInt(inserted) + BigInt(updated);
 
         await prisma.integrationCursor.update({
           where: { reportKey },
@@ -187,10 +232,9 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
         summary[reportKey] = {
           source: pulled.location,
           pulled: pulled.records.length,
-          committed,
+          committed: Number(committed),
           inserted: Number(inserted),
           updated: Number(updated),
-          deleted: Number(deleted),
           since: requestSince,
           through: throughAt,
         };
@@ -215,9 +259,7 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
     }
   }
 
-  // Recompute affected employer snapshots. For now, this is empty since we're
-  // not tracking which employers were modified in this sync. This can be
-  // enhanced to call the proc and ask which employers it touched.
+  // Recompute affected employer snapshots (currently empty since we don't track modified employers)
   for (const employerId of touchedEmployers) {
     try {
       const r = await snapshotEmployer(employerId);
@@ -230,7 +272,6 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
   }
 
   const status = anyFailed ? (anyOk ? "PARTIAL" : "FAILED") : "OK";
-  const mode = configuredSourceMode(config);
   const note = status === "OK"
     ? `All reports synced successfully from ${mode}.`
     : status === "PARTIAL"

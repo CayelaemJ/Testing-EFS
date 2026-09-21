@@ -1,14 +1,13 @@
 // ════════════════════════════════════════════════════════════════════
-//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL
+//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL (OPTIMIZED)
 //
 //  Each report owns its cursor. A failed report never advances its cursor.
-//  API and SQL both feed the same validator and commit path.
+//  Skips Node.js validation/transformation; uses SQL stored procedures
+//  for direct atomic upserts.
 // ════════════════════════════════════════════════════════════════════
 
 import { PrismaClient, Prisma } from "@prisma/client";
 import { LOAD_ORDER, getFormat } from "./reportFormats.js";
-import { validate } from "./importParser.js";
-import { commitBatch } from "./importService.js";
 import { snapshotEmployer } from "./snapshotBuilder.js";
 import { notifyScoreChangeIfCurrentPeriod } from "./automationService.js";
 import { createSourceAdapter, configuredSourceMode, sourceIsConfigured } from "./sourceAdapter.js";
@@ -20,6 +19,20 @@ const CURSOR_OVERLAP_MS = 5 * 60 * 1000;
 function overlapCursor(value?: Date | null): Date | null {
   return value ? new Date(value.getTime() - CURSOR_OVERLAP_MS) : null;
 }
+
+// Map report keys to their stored procedure names
+const SYNC_PROCS: Record<string, string> = {
+  employers: "sync_upsert_employers",
+  employees: "sync_upsert_employees",
+  platform_users: "sync_upsert_platform_users",
+  journeys: "sync_upsert_journeys",
+  debt_accounts: "sync_upsert_debt_accounts",
+  policies: "sync_upsert_policies",
+  ratings: "sync_upsert_ratings",
+  referrals: "sync_upsert_referrals",
+  salary_advances: "sync_upsert_salary_advances",
+  workforce_snapshots: "sync_upsert_workforce_snapshots",
+};
 
 export async function getConfig() {
   return prisma.integrationConfig.upsert({
@@ -121,33 +134,14 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           since: requestSince,
           through: throughAt,
         });
-        const result = validate(format, pulled.records);
-        const futureSourceRows = result.rows.filter((row: any) => row.source_updated_at > throughAt);
+
+        // Sanity check: no rows with future timestamps
+        const futureSourceRows = pulled.records.filter((row: any) => row.source_updated_at > throughAt);
         if (futureSourceRows.length) {
           throw new Error(`${reportKey}: ${futureSourceRows.length} record(s) had source_updated_at later than the requested through timestamp`);
         }
 
-        if (!result.ok) {
-          const note = `Validation failed: ${result.errors.length} cell error(s), ${result.missingColumns.length} required column(s) missing.`;
-          summary[reportKey] = {
-            source: pulled.location,
-            pulled: pulled.records.length,
-            committed: 0,
-            errorCount: result.errors.length,
-            missingColumns: result.missingColumns,
-            unknownColumns: result.unknownColumns,
-            errors: result.errors.slice(0, 20),
-            note,
-          };
-          await prisma.integrationCursor.update({
-            where: { reportKey },
-            data: { lastStatus: "FAILED", lastNote: note },
-          });
-          anyFailed = true;
-          continue;
-        }
-
-        if (result.rowCount === 0) {
+        if (pulled.records.length === 0) {
           await prisma.integrationCursor.update({
             where: { reportKey },
             data: {
@@ -162,22 +156,23 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           continue;
         }
 
-        const batch = await prisma.importBatch.create({
-          data: {
-            reportKey,
-            filename: `${adapter.mode.toLowerCase()}-sync:${reportKey}`,
-            fileFormat: adapter.mode.toLowerCase(),
-            status: "VALIDATED",
-            rowCount: result.rowCount,
-            errorCount: 0,
-            stagedRows: result.rows as unknown as Json,
-            uploadedBy: `${adapter.mode.toLowerCase()}-sync (${trigger})`,
-            sourceSince: cursor.lastSourceUpdatedAt,
-            sourceThrough: throughAt,
-          },
-        });
-        const committed = await commitBatch(batch.id);
-        for (const employerId of []) touchedEmployers.add(employerId);
+        // Call the stored procedure directly instead of validating/transforming
+        // in Node.js. The proc handles upsert atomically in a single SQL transaction.
+        const procName = SYNC_PROCS[reportKey];
+        if (!procName) {
+          throw new Error(`No sync procedure defined for ${reportKey}`);
+        }
+
+        const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; updated: bigint; deleted: bigint }>>`
+          SELECT * FROM ${Prisma.raw(procName)}(${JSON.stringify(pulled.records)}::JSONB)
+        `;
+
+        if (!procResult || procResult.length === 0) {
+          throw new Error(`${reportKey}: stored procedure returned no result`);
+        }
+
+        const { inserted, updated, deleted } = procResult[0];
+        const committed = Number(inserted) + Number(updated);
 
         await prisma.integrationCursor.update({
           where: { reportKey },
@@ -185,17 +180,17 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
             lastSuccessAt: new Date(),
             lastSourceUpdatedAt: throughAt,
             lastStatus: "OK",
-            lastNote: `${committed.inserted} inserted, ${committed.updated} updated, ${committed.deleted} deleted, ${committed.skipped} stale skipped via ${adapter.mode}.`,
+            lastNote: `${inserted} inserted, ${updated} updated via ${adapter.mode}.`,
           },
         });
+
         summary[reportKey] = {
           source: pulled.location,
           pulled: pulled.records.length,
-          committed: result.rowCount,
-          inserted: committed.inserted,
-          updated: committed.updated,
-          deleted: committed.deleted,
-          staleSkipped: committed.skipped,
+          committed,
+          inserted: Number(inserted),
+          updated: Number(updated),
+          deleted: Number(deleted),
           since: requestSince,
           through: throughAt,
         };
@@ -220,6 +215,9 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
     }
   }
 
+  // Recompute affected employer snapshots. For now, this is empty since we're
+  // not tracking which employers were modified in this sync. This can be
+  // enhanced to call the proc and ask which employers it touched.
   for (const employerId of touchedEmployers) {
     try {
       const r = await snapshotEmployer(employerId);
@@ -234,7 +232,7 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
   const status = anyFailed ? (anyOk ? "PARTIAL" : "FAILED") : "OK";
   const mode = configuredSourceMode(config);
   const note = status === "OK"
-    ? `All reports synced successfully from ${mode} and employer snapshots were rebuilt.`
+    ? `All reports synced successfully from ${mode}.`
     : status === "PARTIAL"
       ? `Some ${mode} reports synced. Failed report cursors were not advanced; see details.`
       : `${mode} sync failed; no report cursor was advanced for failed feeds.`;
@@ -283,3 +281,4 @@ export async function testConnection(patch: IntegrationConfigPatch = {}) {
 export async function recentSyncLogs(n = 10) {
   return prisma.syncLog.findMany({ orderBy: { startedAt: "desc" }, take: n });
 }
+

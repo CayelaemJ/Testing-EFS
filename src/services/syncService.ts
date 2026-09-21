@@ -1,9 +1,9 @@
 // ════════════════════════════════════════════════════════════════════
-//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL (ULTRA-OPTIMIZED)
+//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL (BULK OPTIMIZED)
 //
 //  Each report owns its cursor. A failed report never advances its cursor.
-//  SQL integrations use direct INSERT ... SELECT (zero parsing, zero loop).
-//  API integrations use bulk upsert stored procedures.
+//  SQL integrations use bulk replace (delete window + insert).
+//  API integrations use JSONB upsert stored procedures.
 // ════════════════════════════════════════════════════════════════════
 
 import { PrismaClient, Prisma } from "@prisma/client";
@@ -20,18 +20,18 @@ function overlapCursor(value?: Date | null): Date | null {
   return value ? new Date(value.getTime() - CURSOR_OVERLAP_MS) : null;
 }
 
-// Map report keys to their direct SQL sync procedure names
-const DIRECT_SQL_PROCS: Record<string, string> = {
-  employers: "sync_employers_direct",
-  employees: "sync_employees_direct",
-  platform_users: "sync_platform_users_direct",
-  journeys: "sync_journeys_direct",
-  debt_accounts: "sync_debt_accounts_direct",
-  policies: "sync_policies_direct",
-  ratings: "sync_ratings_direct",
-  referrals: "sync_referrals_direct",
-  salary_advances: "sync_salary_advances_direct",
-  workforce_snapshots: "sync_workforce_snapshots_direct",
+// Map report keys to their bulk SQL sync procedure names (delete + insert)
+const BULK_SQL_PROCS: Record<string, string> = {
+  employers: "sync_employers_bulk",
+  employees: "sync_employees_bulk",
+  platform_users: "sync_platform_users_bulk",
+  journeys: "sync_journeys_bulk",
+  debt_accounts: "sync_debt_accounts_bulk",
+  policies: "sync_policies_bulk",
+  ratings: "sync_ratings_bulk",
+  referrals: "sync_referrals_bulk",
+  salary_advances: "sync_salary_advances_bulk",
+  workforce_snapshots: "sync_workforce_snapshots_bulk",
 };
 
 // Map report keys to their JSONB upsert procedure names (for API)
@@ -172,18 +172,17 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
         }
 
         let inserted: bigint = 0n;
-        let updated: bigint = 0n;
+        let deleted: bigint = 0n;
 
         if (mode === "SQL") {
-          // SQL integration: Direct INSERT ... SELECT (fastest path)
-          // Zero JSONB parsing, zero row-by-row loops. Pure SQL.
-          const procName = DIRECT_SQL_PROCS[reportKey];
+          // SQL integration: Bulk replace (fastest path)
+          // DELETE sync window + BULK INSERT. Zero constraint checks.
+          const procName = BULK_SQL_PROCS[reportKey];
           if (!procName) {
-            throw new Error(`No direct SQL sync procedure defined for ${reportKey}`);
+            throw new Error(`No bulk SQL sync procedure defined for ${reportKey}`);
           }
 
-          // Call the procedure: it handles INSERT ... SELECT directly from source views
-          const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; updated: bigint }>>`
+          const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; deleted: bigint }>>`
             CALL ${Prisma.raw(procName)}(
               ${config.sqlSchema || "public"},
               ${config.sqlViewPrefix || "v_"},
@@ -197,7 +196,7 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           }
 
           inserted = procResult[0].inserted;
-          updated = procResult[0].updated;
+          deleted = procResult[0].deleted;
         } else {
           // API integration: Convert to JSONB and call upsert procedure
           const procName = JSONB_PROCS[reportKey];
@@ -214,10 +213,10 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           }
 
           inserted = procResult[0].inserted;
-          updated = procResult[0].updated;
+          // For API, we track insertions; SQL uses delete + insert so we report net inserted
         }
 
-        const committed = BigInt(inserted) + BigInt(updated);
+        const committed = BigInt(inserted);
 
         await prisma.integrationCursor.update({
           where: { reportKey },
@@ -225,7 +224,9 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
             lastSuccessAt: new Date(),
             lastSourceUpdatedAt: throughAt,
             lastStatus: "OK",
-            lastNote: `${inserted} inserted, ${updated} updated via ${adapter.mode}.`,
+            lastNote: mode === "SQL" 
+              ? `${deleted} deleted (stale), ${inserted} inserted via ${adapter.mode}.`
+              : `${inserted} inserted/updated via ${adapter.mode}.`,
           },
         });
 
@@ -234,7 +235,7 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           pulled: pulled.records.length,
           committed: Number(committed),
           inserted: Number(inserted),
-          updated: Number(updated),
+          ...(mode === "SQL" ? { deleted: Number(deleted) } : {}),
           since: requestSince,
           through: throughAt,
         };

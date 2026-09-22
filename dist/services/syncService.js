@@ -7,12 +7,19 @@
 import { PrismaClient } from "@prisma/client";
 import { LOAD_ORDER, getFormat } from "./reportFormats.js";
 import { validate } from "./importParser.js";
-import { commitBatch } from "./importService.js";
+import { commitBatch, chunkedRowWriter } from "./importService.js";
 import { snapshotEmployer } from "./snapshotBuilder.js";
 import { notifyScoreChangeIfCurrentPeriod } from "./automationService.js";
 import { createSourceAdapter, configuredSourceMode, sourceIsConfigured } from "./sourceAdapter.js";
 const prisma = new PrismaClient();
 const CURSOR_OVERLAP_MS = 5 * 60 * 1000;
+// Tolerate small clock drift between the source database and this app
+// server (common across two different hosts/regions — e.g. a Railway DB
+// vs. wherever this service runs). Previously ANY drift, even a few
+// seconds, hard-failed the WHOLE report on every single sync, forever —
+// which looks exactly like "the schema/view is fine, but it never
+// actually syncs or produces visuals".
+const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
 function overlapCursor(value) {
     return value ? new Date(value.getTime() - CURSOR_OVERLAP_MS) : null;
 }
@@ -98,10 +105,15 @@ export async function runSync(trigger = "manual") {
                     through: throughAt,
                 });
                 const result = validate(format, pulled.records);
-                const futureSourceRows = result.rows.filter((row) => row.source_updated_at > throughAt);
-                if (futureSourceRows.length) {
-                    throw new Error(`${reportKey}: ${futureSourceRows.length} record(s) had source_updated_at later than the requested through timestamp`);
+                // Genuinely bad/faked-future data still fails the report, but a
+                // small amount of drift is clamped instead of killing the whole
+                // report on every retry.
+                const skewCeiling = new Date(throughAt.getTime() + CLOCK_SKEW_TOLERANCE_MS);
+                const genuinelyFutureRows = result.rows.filter((row) => row.source_updated_at > skewCeiling);
+                if (genuinelyFutureRows.length) {
+                    throw new Error(`${reportKey}: ${genuinelyFutureRows.length} record(s) had source_updated_at more than ${CLOCK_SKEW_TOLERANCE_MS / 60000} minute(s) later than the requested through timestamp — check the source database's clock/timezone settings.`);
                 }
+                result.rows = result.rows.map((row) => row.source_updated_at > throughAt ? { ...row, source_updated_at: throughAt } : row);
                 if (!result.ok) {
                     const note = `Validation failed: ${result.errors.length} cell error(s), ${result.missingColumns.length} required column(s) missing.`;
                     summary[reportKey] = {
@@ -135,22 +147,31 @@ export async function runSync(trigger = "manual") {
                     anyOk = true;
                     continue;
                 }
+                // Create the batch first in UPLOADED state (same as file upload)
                 const batch = await prisma.importBatch.create({
                     data: {
                         reportKey,
                         filename: `${adapter.mode.toLowerCase()}-sync:${reportKey}`,
                         fileFormat: adapter.mode.toLowerCase(),
-                        status: "VALIDATED",
+                        status: "UPLOADED",
                         rowCount: result.rowCount,
-                        errorCount: 0,
-                        stagedRows: result.rows,
                         uploadedBy: `${adapter.mode.toLowerCase()}-sync (${trigger})`,
                         sourceSince: cursor.lastSourceUpdatedAt,
                         sourceThrough: throughAt,
                     },
                 });
-                const committed = await commitBatch(batch.id);
-                for (const employerId of [])
+                // Write validated rows to importBatchRow using the same chunked writer as file uploads
+                // This ensures rows are properly persisted before commit, not just stored in a JSON blob
+                const writeChunkToDb = await chunkedRowWriter(batch.id);
+                await writeChunkToDb(result.rows);
+                // Mark batch as validated (ready to commit)
+                await prisma.importBatch.update({
+                    where: { id: batch.id },
+                    data: { status: "VALIDATED", errorCount: 0 },
+                });
+                // Now commit with rows properly stored in the database
+                const committed = await commitBatch(batch.id, { recompute: false });
+                for (const employerId of committed.touchedEmployers)
                     touchedEmployers.add(employerId);
                 await prisma.integrationCursor.update({
                     where: { reportKey },

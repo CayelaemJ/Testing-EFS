@@ -44,7 +44,7 @@ function deletionTime(row: Record<string, any>): Date | null {
 
 // Writes validated rows into ImportBatchRow in bounded chunks instead of
 // building one giant array/JSON blob for the whole file (see schema.prisma).
-async function chunkedRowWriter(batchId: string) {
+export async function chunkedRowWriter(batchId: string) {
   let offset = 0;
   return async (rows: Record<string, unknown>[]) => {
     if (!rows.length) return;

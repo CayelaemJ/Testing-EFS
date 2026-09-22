@@ -194,15 +194,15 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
         });
 
         // Also write to importBatchRow so commitBatch can find them
-        for (let i = 0; i < result.rows.length; i++) {
-          await prisma.importBatchRow.create({
-            data: {
-              batchId: batch.id,
-              rowIndex: i,
-              data: result.rows[i] as unknown as Json,
-            },
-          });
-        }
+     if (result.rows.length > 0) {
+  await prisma.importBatchRow.createMany({
+    data: result.rows.map((row, i) => ({
+      batchId: batch.id,
+      rowIndex: i,
+      data: row as unknown as Json,
+    })),
+  });
+}
 
         const committed = await commitBatch(batch.id, { recompute: false });
         for (const employerId of committed.touchedEmployers) touchedEmployers.add(employerId);

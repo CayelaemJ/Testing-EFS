@@ -16,16 +16,22 @@ import { createSourceAdapter, configuredSourceMode, sourceIsConfigured } from ".
 const prisma = new PrismaClient();
 type Json = Prisma.InputJsonValue;
 const CURSOR_OVERLAP_MS = 5 * 60 * 1000;
-// Tolerate small clock drift between the source database and this app
-// server (common across two different hosts/regions — e.g. a Railway DB
-// vs. wherever this service runs). Previously ANY drift, even a few
-// seconds, hard-failed the WHOLE report on every single sync, forever —
-// which looks exactly like "the schema/view is fine, but it never
-// actually syncs or produces visuals".
 const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+const CHUNK_SIZE = 1000;
 
 function overlapCursor(value?: Date | null): Date | null {
   return value ? new Date(value.getTime() - CURSOR_OVERLAP_MS) : null;
+}
+
+async function chunkedRowWriter(batchId: string) {
+  let offset = 0;
+  return async (rows: Record<string, unknown>[]) => {
+    if (!rows.length) return;
+    await prisma.importBatchRow.createMany({
+      data: rows.map((data, i) => ({ batchId, rowIndex: offset + i, data: data as unknown as Json })),
+    });
+    offset += rows.length;
+  };
 }
 
 export async function getConfig() {
@@ -130,9 +136,6 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
         });
         const result = validate(format, pulled.records);
 
-        // Genuinely bad/faked-future data still fails the report, but a
-        // small amount of drift is clamped instead of killing the whole
-        // report on every retry.
         const skewCeiling = new Date(throughAt.getTime() + CLOCK_SKEW_TOLERANCE_MS);
         const genuinelyFutureRows = result.rows.filter((row: any) => row.source_updated_at > skewCeiling);
         if (genuinelyFutureRows.length) {
@@ -177,7 +180,6 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           continue;
         }
 
-        // Write rows to importBatchRow instead of storing in stagedRows blob
         const batch = await prisma.importBatch.create({
           data: {
             reportKey,
@@ -193,16 +195,11 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           },
         });
 
-        // Also write to importBatchRow so commitBatch can find them
-     if (result.rows.length > 0) {
-  await prisma.importBatchRow.createMany({
-    data: result.rows.map((row, i) => ({
-      batchId: batch.id,
-      rowIndex: i,
-      data: row as unknown as Json,
-    })),
-  });
-}
+        const writeChunk = await chunkedRowWriter(batch.id);
+        for (let i = 0; i < result.rows.length; i += CHUNK_SIZE) {
+          const chunk = result.rows.slice(i, i + CHUNK_SIZE);
+          await writeChunk(chunk);
+        }
 
         const committed = await commitBatch(batch.id, { recompute: false });
         for (const employerId of committed.touchedEmployers) touchedEmployers.add(employerId);
@@ -287,9 +284,6 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
 
 export async function testConnection(patch: IntegrationConfigPatch = {}) {
   const saved = await getConfig();
-  // Test the values currently entered in Administration without forcing the
-  // user to persist them first. Blank secret fields intentionally keep the
-  // saved secret (or environment-provided secret) rather than clearing it.
   const cleanPatch: IntegrationConfigPatch = { ...patch };
   if (cleanPatch.authToken === "" || cleanPatch.authToken == null) delete cleanPatch.authToken;
   if (cleanPatch.sqlPassword === "" || cleanPatch.sqlPassword == null) delete cleanPatch.sqlPassword;

@@ -1,13 +1,14 @@
 // ════════════════════════════════════════════════════════════════════
-//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL (BULK OPTIMIZED)
+//  EXTERNAL SOURCE SYNC — API OR DIRECT SQL
 //
 //  Each report owns its cursor. A failed report never advances its cursor.
-//  SQL integrations use bulk replace (delete window + insert).
-//  API integrations use JSONB upsert stored procedures.
+//  API and SQL both feed the same validator and commit path.
 // ════════════════════════════════════════════════════════════════════
 
 import { PrismaClient, Prisma } from "@prisma/client";
 import { LOAD_ORDER, getFormat } from "./reportFormats.js";
+import { validate } from "./importParser.js";
+import { commitBatch } from "./importService.js";
 import { snapshotEmployer } from "./snapshotBuilder.js";
 import { notifyScoreChangeIfCurrentPeriod } from "./automationService.js";
 import { createSourceAdapter, configuredSourceMode, sourceIsConfigured } from "./sourceAdapter.js";
@@ -15,38 +16,17 @@ import { createSourceAdapter, configuredSourceMode, sourceIsConfigured } from ".
 const prisma = new PrismaClient();
 type Json = Prisma.InputJsonValue;
 const CURSOR_OVERLAP_MS = 5 * 60 * 1000;
+// Tolerate small clock drift between the source database and this app
+// server (common across two different hosts/regions — e.g. a Railway DB
+// vs. wherever this service runs). Previously ANY drift, even a few
+// seconds, hard-failed the WHOLE report on every single sync, forever —
+// which looks exactly like "the schema/view is fine, but it never
+// actually syncs or produces visuals".
+const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
 
 function overlapCursor(value?: Date | null): Date | null {
   return value ? new Date(value.getTime() - CURSOR_OVERLAP_MS) : null;
 }
-
-// Map report keys to their bulk SQL sync procedure names (delete + insert)
-const BULK_SQL_PROCS: Record<string, string> = {
-  employers: "sync_employers_bulk",
-  employees: "sync_employees_bulk",
-  platform_users: "sync_platform_users_bulk",
-  journeys: "sync_journeys_bulk",
-  debt_accounts: "sync_debt_accounts_bulk",
-  policies: "sync_policies_bulk",
-  ratings: "sync_ratings_bulk",
-  referrals: "sync_referrals_bulk",
-  salary_advances: "sync_salary_advances_bulk",
-  workforce_snapshots: "sync_workforce_snapshots_bulk",
-};
-
-// Map report keys to their JSONB upsert procedure names (for API)
-const JSONB_PROCS: Record<string, string> = {
-  employers: "sync_upsert_employers",
-  employees: "sync_upsert_employees",
-  platform_users: "sync_upsert_platform_users",
-  journeys: "sync_upsert_journeys",
-  debt_accounts: "sync_upsert_debt_accounts",
-  policies: "sync_upsert_policies",
-  ratings: "sync_upsert_ratings",
-  referrals: "sync_upsert_referrals",
-  salary_advances: "sync_upsert_salary_advances",
-  workforce_snapshots: "sync_upsert_workforce_snapshots",
-};
 
 export async function getConfig() {
   return prisma.integrationConfig.upsert({
@@ -128,7 +108,6 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
   let anyFailed = false;
   let anyOk = false;
   let adapter: Awaited<ReturnType<typeof createSourceAdapter>> | null = null;
-  const mode = configuredSourceMode(config);
 
   try {
     adapter = await createSourceAdapter(config);
@@ -149,14 +128,41 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           since: requestSince,
           through: throughAt,
         });
+        const result = validate(format, pulled.records);
 
-        // Sanity check: no rows with future timestamps
-        const futureSourceRows = pulled.records.filter((row: any) => row.source_updated_at > throughAt);
-        if (futureSourceRows.length) {
-          throw new Error(`${reportKey}: ${futureSourceRows.length} record(s) had source_updated_at later than the requested through timestamp`);
+        // Genuinely bad/faked-future data still fails the report, but a
+        // small amount of drift is clamped instead of killing the whole
+        // report on every retry.
+        const skewCeiling = new Date(throughAt.getTime() + CLOCK_SKEW_TOLERANCE_MS);
+        const genuinelyFutureRows = result.rows.filter((row: any) => row.source_updated_at > skewCeiling);
+        if (genuinelyFutureRows.length) {
+          throw new Error(`${reportKey}: ${genuinelyFutureRows.length} record(s) had source_updated_at more than ${CLOCK_SKEW_TOLERANCE_MS / 60000} minute(s) later than the requested through timestamp — check the source database's clock/timezone settings.`);
+        }
+        result.rows = result.rows.map((row: any) =>
+          row.source_updated_at > throughAt ? { ...row, source_updated_at: throughAt } : row
+        );
+
+        if (!result.ok) {
+          const note = `Validation failed: ${result.errors.length} cell error(s), ${result.missingColumns.length} required column(s) missing.`;
+          summary[reportKey] = {
+            source: pulled.location,
+            pulled: pulled.records.length,
+            committed: 0,
+            errorCount: result.errors.length,
+            missingColumns: result.missingColumns,
+            unknownColumns: result.unknownColumns,
+            errors: result.errors.slice(0, 20),
+            note,
+          };
+          await prisma.integrationCursor.update({
+            where: { reportKey },
+            data: { lastStatus: "FAILED", lastNote: note },
+          });
+          anyFailed = true;
+          continue;
         }
 
-        if (pulled.records.length === 0) {
+        if (result.rowCount === 0) {
           await prisma.integrationCursor.update({
             where: { reportKey },
             data: {
@@ -171,52 +177,22 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           continue;
         }
 
-        let inserted: bigint = 0n;
-        let deleted: bigint = 0n;
-
-        if (mode === "SQL") {
-          // SQL integration: Bulk replace (fastest path)
-          // DELETE sync window + BULK INSERT. Zero constraint checks.
-          const procName = BULK_SQL_PROCS[reportKey];
-          if (!procName) {
-            throw new Error(`No bulk SQL sync procedure defined for ${reportKey}`);
-          }
-
-          const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; deleted: bigint }>>`
-            CALL ${Prisma.raw(procName)}(
-              ${config.sqlSchema || "public"},
-              ${config.sqlViewPrefix || "v_"},
-              ${requestSince},
-              ${throughAt}
-            )
-          `;
-
-          if (!procResult || procResult.length === 0) {
-            throw new Error(`${reportKey}: stored procedure returned no result`);
-          }
-
-          inserted = procResult[0].inserted;
-          deleted = procResult[0].deleted;
-        } else {
-          // API integration: Convert to JSONB and call upsert procedure
-          const procName = JSONB_PROCS[reportKey];
-          if (!procName) {
-            throw new Error(`No JSONB sync procedure defined for ${reportKey}`);
-          }
-
-          const procResult = await prisma.$queryRaw<Array<{ inserted: bigint; updated: bigint; deleted: bigint }>>`
-            SELECT * FROM ${Prisma.raw(procName)}(${JSON.stringify(pulled.records)}::JSONB)
-          `;
-
-          if (!procResult || procResult.length === 0) {
-            throw new Error(`${reportKey}: stored procedure returned no result`);
-          }
-
-          inserted = procResult[0].inserted;
-          // For API, we track insertions; SQL uses delete + insert so we report net inserted
-        }
-
-        const committed = BigInt(inserted);
+        const batch = await prisma.importBatch.create({
+          data: {
+            reportKey,
+            filename: `${adapter.mode.toLowerCase()}-sync:${reportKey}`,
+            fileFormat: adapter.mode.toLowerCase(),
+            status: "VALIDATED",
+            rowCount: result.rowCount,
+            errorCount: 0,
+            stagedRows: result.rows as unknown as Json,
+            uploadedBy: `${adapter.mode.toLowerCase()}-sync (${trigger})`,
+            sourceSince: cursor.lastSourceUpdatedAt,
+            sourceThrough: throughAt,
+          },
+        });
+        const committed = await commitBatch(batch.id, { recompute: false });
+        for (const employerId of committed.touchedEmployers) touchedEmployers.add(employerId);
 
         await prisma.integrationCursor.update({
           where: { reportKey },
@@ -224,18 +200,17 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
             lastSuccessAt: new Date(),
             lastSourceUpdatedAt: throughAt,
             lastStatus: "OK",
-            lastNote: mode === "SQL" 
-              ? `${deleted} deleted (stale), ${inserted} inserted via ${adapter.mode}.`
-              : `${inserted} inserted/updated via ${adapter.mode}.`,
+            lastNote: `${committed.inserted} inserted, ${committed.updated} updated, ${committed.deleted} deleted, ${committed.skipped} stale skipped via ${adapter.mode}.`,
           },
         });
-
         summary[reportKey] = {
           source: pulled.location,
           pulled: pulled.records.length,
-          committed: Number(committed),
-          inserted: Number(inserted),
-          ...(mode === "SQL" ? { deleted: Number(deleted) } : {}),
+          committed: result.rowCount,
+          inserted: committed.inserted,
+          updated: committed.updated,
+          deleted: committed.deleted,
+          staleSkipped: committed.skipped,
           since: requestSince,
           through: throughAt,
         };
@@ -260,7 +235,6 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
     }
   }
 
-  // Recompute affected employer snapshots (currently empty since we don't track modified employers)
   for (const employerId of touchedEmployers) {
     try {
       const r = await snapshotEmployer(employerId);
@@ -273,8 +247,9 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
   }
 
   const status = anyFailed ? (anyOk ? "PARTIAL" : "FAILED") : "OK";
+  const mode = configuredSourceMode(config);
   const note = status === "OK"
-    ? `All reports synced successfully from ${mode}.`
+    ? `All reports synced successfully from ${mode} and employer snapshots were rebuilt.`
     : status === "PARTIAL"
       ? `Some ${mode} reports synced. Failed report cursors were not advanced; see details.`
       : `${mode} sync failed; no report cursor was advanced for failed feeds.`;
@@ -323,4 +298,3 @@ export async function testConnection(patch: IntegrationConfigPatch = {}) {
 export async function recentSyncLogs(n = 10) {
   return prisma.syncLog.findMany({ orderBy: { startedAt: "desc" }, take: n });
 }
-

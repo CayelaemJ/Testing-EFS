@@ -177,6 +177,7 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           continue;
         }
 
+        // Write rows to importBatchRow instead of storing in stagedRows blob
         const batch = await prisma.importBatch.create({
           data: {
             reportKey,
@@ -191,6 +192,18 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
             sourceThrough: throughAt,
           },
         });
+
+        // Also write to importBatchRow so commitBatch can find them
+        for (let i = 0; i < result.rows.length; i++) {
+          await prisma.importBatchRow.create({
+            data: {
+              batchId: batch.id,
+              rowIndex: i,
+              data: result.rows[i] as unknown as Json,
+            },
+          });
+        }
+
         const committed = await commitBatch(batch.id, { recompute: false });
         for (const employerId of committed.touchedEmployers) touchedEmployers.add(employerId);
 
@@ -298,3 +311,4 @@ export async function testConnection(patch: IntegrationConfigPatch = {}) {
 export async function recentSyncLogs(n = 10) {
   return prisma.syncLog.findMany({ orderBy: { startedAt: "desc" }, take: n });
 }
+

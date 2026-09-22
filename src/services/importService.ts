@@ -662,7 +662,7 @@ export async function commitBatch(batchId: string, options: CommitOptions = {}) 
 
   for (const chunk of chunks) {
     await prisma.$transaction(
-      (tx: any) => await commitRowsChunk(tx, batch.reportKey, chunk, stats, batchId),
+      async (tx: any) => await commitRowsChunk(tx, batch.reportKey, chunk, stats, batchId),
       { timeout: IMPORT_TX_TIMEOUT_MS, maxWait: 30000 },
     );
   }

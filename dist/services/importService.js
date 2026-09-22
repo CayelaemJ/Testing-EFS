@@ -627,7 +627,7 @@ export async function commitBatch(batchId, options = {}) {
     if (!chunks.length)
         chunks.push([]);
     for (const chunk of chunks) {
-        await prisma.$transaction((tx) => commitRowsChunk(tx, batch.reportKey, chunk, stats, batchId), { timeout: IMPORT_TX_TIMEOUT_MS, maxWait: 30000 });
+        await prisma.$transaction(async (tx) => await commitRowsChunk(tx, batch.reportKey, chunk, stats, batchId), { timeout: IMPORT_TX_TIMEOUT_MS, maxWait: 30000 });
     }
     // Refresh workforce denominator caches once per affected employer, rather
     // than once per 1k-row transaction. This is a major speed-up for large

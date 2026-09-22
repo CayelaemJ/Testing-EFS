@@ -8,7 +8,7 @@
 import { PrismaClient, Prisma } from "@prisma/client";
 import { LOAD_ORDER, getFormat } from "./reportFormats.js";
 import { validate } from "./importParser.js";
-import { commitBatch, chunkedRowWriter } from "./importService.js";
+import { commitBatch } from "./importService.js";
 import { snapshotEmployer } from "./snapshotBuilder.js";
 import { notifyScoreChangeIfCurrentPeriod } from "./automationService.js";
 import { createSourceAdapter, configuredSourceMode, sourceIsConfigured } from "./sourceAdapter.js";
@@ -177,32 +177,20 @@ export async function runSync(trigger: "manual" | "scheduled" = "manual") {
           continue;
         }
 
-        // Create the batch first in UPLOADED state (same as file upload)
         const batch = await prisma.importBatch.create({
           data: {
             reportKey,
             filename: `${adapter.mode.toLowerCase()}-sync:${reportKey}`,
             fileFormat: adapter.mode.toLowerCase(),
-            status: "UPLOADED",
+            status: "VALIDATED",
             rowCount: result.rowCount,
+            errorCount: 0,
+            stagedRows: result.rows as unknown as Json,
             uploadedBy: `${adapter.mode.toLowerCase()}-sync (${trigger})`,
             sourceSince: cursor.lastSourceUpdatedAt,
             sourceThrough: throughAt,
           },
         });
-
-        // Write validated rows to importBatchRow using the same chunked writer as file uploads
-        // This ensures rows are properly persisted before commit, not just stored in a JSON blob
-        const writeChunkToDb = await chunkedRowWriter(batch.id);
-        await writeChunkToDb(result.rows);
-
-        // Mark batch as validated (ready to commit)
-        await prisma.importBatch.update({
-          where: { id: batch.id },
-          data: { status: "VALIDATED", errorCount: 0 },
-        });
-
-        // Now commit with rows properly stored in the database
         const committed = await commitBatch(batch.id, { recompute: false });
         for (const employerId of committed.touchedEmployers) touchedEmployers.add(employerId);
 
@@ -310,4 +298,3 @@ export async function testConnection(patch: IntegrationConfigPatch = {}) {
 export async function recentSyncLogs(n = 10) {
   return prisma.syncLog.findMany({ orderBy: { startedAt: "desc" }, take: n });
 }
-

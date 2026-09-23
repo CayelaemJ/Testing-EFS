@@ -19,7 +19,8 @@
     "check:scheduling": "node scripts/scheduling-regression-check.mjs",
     "db:rebuild-scores": "tsx scripts/rebuild-score-snapshots.ts",
     "security:audit": "npm audit --audit-level=high",
-    "check:security": "node scripts/security-regression-check.mjs"
+    "check:security": "node scripts/security-regression-check.mjs",
+    "sync:configure": "node scripts/configure-mysql-sync.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^9.3.1",

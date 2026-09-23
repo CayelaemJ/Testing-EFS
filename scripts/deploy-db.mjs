@@ -35,5 +35,16 @@ const status = run(["db", "push", "--skip-generate"]);
 if (status !== 0) {
   console.error("Database schema sync failed. Because destructive fallback is disabled, no reset was attempted.");
   console.error("For a disposable pre-live database only, set PRELIVE_RESET_DATABASE=true and PRELIVE_RESET_CONFIRM=DELETE_PRELIVE_DATA for one deployment, then remove both variables.");
+  process.exit(status);
 }
-process.exit(status);
+
+// ── Configure MySQL as sync source if credentials are available ──
+if (process.env.MYSQLHOST && process.env.MYSQLUSER && process.env.MYSQLPASSWORD && process.env.MYSQLDATABASE) {
+  console.log("\n📡 Configuring MySQL as live data sync source...");
+  const syncStatus = spawnSync("node", ["scripts/configure-mysql-sync.mjs"], { stdio: "inherit" });
+  if (syncStatus.status !== 0) {
+    console.warn("⚠️  MySQL sync configuration skipped (credentials incomplete or connection failed)");
+  }
+}
+
+process.exit(0);

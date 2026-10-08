@@ -160,9 +160,9 @@ app.register(fastifyStatic, {
   // cannot appear to retain an older navigation/integration screen.
   setHeaders(res, filePath) {
     if (/\.(?:js|css|html)$/i.test(filePath)) {
-      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
+      res.header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.header("Pragma", "no-cache");
+      res.header("Expires", "0");
     }
   },
 });

@@ -1,0 +1,53 @@
+version: 2.1
+jobs:
+  security_suite:
+    docker:
+      - image: cimg/go:1.24
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install Python runtime and prerequisites
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y python3 python3-pip python3-venv curl
+            python3 -m venv "$HOME/security-venv"
+            echo 'export PATH="$HOME/security-venv/bin:$PATH"' >> "$BASH_ENV"
+      - run:
+          name: Semgrep, Gitleaks, Trivy, optional Nuclei and Schemathesis
+          command: bash .circleci/security.sh
+          no_output_timeout: 15m
+      - store_artifacts:
+          path: security-reports
+          destination: security-reports
+  zap_baseline:
+    docker:
+      - image: cimg/base:stable
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Require approved staging target
+          command: |
+            if [ "${SECURITY_ZAP_APPROVED:-}" != "YES_STAGING_ONLY" ] || [ -z "${SECURITY_ZAP_TARGET_URL:-}" ]; then
+              echo "ZAP skipped until approved staging URL is provided"
+              circleci-agent step halt
+            fi
+            case "$SECURITY_ZAP_TARGET_URL" in
+              https://*staging*|https://*test*|https://*preview*) ;;
+              *) echo "Staging/test/preview HTTPS target required"; exit 2;;
+            esac
+      - setup_remote_docker
+      - run:
+          name: OWASP ZAP passive baseline
+          command: docker run --rm ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "$SECURITY_ZAP_TARGET_URL" -m 1 -I
+          no_output_timeout: 15m
+
+workflows:
+  security_audit:
+    jobs:
+      - zap_baseline:
+          filters:
+            branches:
+              only: main
+      - security_suite

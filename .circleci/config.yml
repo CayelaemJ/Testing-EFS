@@ -20,9 +20,36 @@ jobs:
       - store_artifacts:
           path: security-reports
           destination: security-reports
+  zap_baseline:
+    docker:
+      - image: cimg/base:stable
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Require approved staging target
+          command: |
+            if [ "${SECURITY_ZAP_APPROVED:-}" != "YES_STAGING_ONLY" ] || [ -z "${SECURITY_ZAP_TARGET_URL:-}" ]; then
+              echo "ZAP skipped until approved staging URL is provided"
+              circleci-agent step halt
+            fi
+            case "$SECURITY_ZAP_TARGET_URL" in
+              https://*staging*|https://*test*|https://*preview*) ;;
+              *) echo "Staging/test/preview HTTPS target required"; exit 2;;
+            esac
+      - setup_remote_docker
+      - run:
+          name: OWASP ZAP passive baseline
+          command: docker run --rm ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "$SECURITY_ZAP_TARGET_URL" -m 1 -I
+          no_output_timeout: 15m
+
 workflows:
   security_audit:
     jobs:
+      - zap_baseline:
+          filters:
+            branches:
+              only: main
       - security_suite:
           filters:
             branches:

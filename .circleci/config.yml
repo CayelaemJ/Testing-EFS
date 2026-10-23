@@ -1,0 +1,30 @@
+version: 2.1
+jobs:
+  security_suite:
+    docker:
+      - image: cimg/go:1.24
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install Python runtime and prerequisites
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y python3 python3-pip python3-venv curl
+            python3 -m venv "$HOME/security-venv"
+            echo 'export PATH="$HOME/security-venv/bin:$PATH"' >> "$BASH_ENV"
+      - run:
+          name: Semgrep, Gitleaks, Trivy, optional Nuclei and Schemathesis
+          command: bash .circleci/security.sh
+          no_output_timeout: 15m
+      - store_artifacts:
+          path: security-reports
+          destination: security-reports
+          when: always
+workflows:
+  security_audit:
+    jobs:
+      - security_suite:
+          filters:
+            branches:
+              only: main

@@ -110,8 +110,15 @@ app.addHook("onRequest", async (req, reply) => {
     reply.header("Pragma", "no-cache");
   }
   const ip = req.ip || "unknown";
-  const authPath = path === "/api/auth/login" || path === "/api/auth/forgot-password" || path === "/api/auth/set-password";
-  if (!rateLimit(reply, `${authPath ? "auth" : "api"}:${ip}`, authPath ? AUTH_RATE_LIMIT : RATE_LIMIT, authPath ? AUTH_WINDOW_MS : RATE_WINDOW_MS)) return;
+  // Apply a general budget first; sensitive APIs have independent, tighter limits.
+  if (!rateLimit(reply, `api:${ip}`, RATE_LIMIT, RATE_WINDOW_MS)) return;
+  const authPath = /^\/api\/auth\/(?:login|forgot-password|set-password)(?:\/|$)/.test(path);
+  if (authPath && !rateLimit(reply, `auth:${ip}`, AUTH_RATE_LIMIT, AUTH_WINDOW_MS)) return;
+  if (path === "/api/contact" && !rateLimit(reply, `contact:${ip}`, 6, 10 * 60_000)) return;
+  if (/\/(?:upload|import|batch|sync|staging|dataset)(?:s|\/|-|$)/.test(path) &&
+      !rateLimit(reply, `bulk:${ip}`, 20, 10 * 60_000)) return;
+  if (/\/(?:report|export|analytics)(?:s|\/|-|$)/.test(path) &&
+      !rateLimit(reply, `reports:${ip}`, 40, 60_000)) return;
 
   // Cookie-authenticated state-changing API calls must originate from this
   // application. Bearer-token API clients are exempt because they don't carry

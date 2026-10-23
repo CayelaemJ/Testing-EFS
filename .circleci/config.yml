@@ -20,7 +20,6 @@ jobs:
       - store_artifacts:
           path: security-reports
           destination: security-reports
-          when: always
 workflows:
   security_audit:
     jobs:

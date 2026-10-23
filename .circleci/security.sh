@@ -5,7 +5,7 @@ export PATH="$HOME/.local/bin:$HOME/go/bin:$PATH"
 echo "Installing security scanners"
 python -m pip install --disable-pip-version-check "semgrep>=1.100,<2" "schemathesis>=4,<5"
 mkdir -p "$HOME/.local/bin"
-curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$HOME/.local/bin"
+curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$HOME/.local/bin" -v v0.67.2
 curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar -xz -C "$HOME/.local/bin" gitleaks
 echo "Running independent security scans"
 failed=0

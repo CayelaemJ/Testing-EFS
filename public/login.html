@@ -63,6 +63,7 @@
     <div class="logo"><img src="/static/logo-large.png" alt="empower-fin Dashboard Portal" style="height:54px;width:auto;"></div>
     <h1>Sign in</h1>
     <div class="sub" id="brand-sub">Employee financial wellbeing platform</div>
+    <form id="sign-in-form" onsubmit="event.preventDefault();signIn()">
     <label for="email">Email</label>
     <input id="email" type="email" autocomplete="username" placeholder="you@company.com">
     <label for="password">Password</label>
@@ -74,18 +75,21 @@
       <input id="remember" type="checkbox" style="width:auto;margin:0;accent-color:var(--brand-primary);cursor:pointer;">
       Remember me
     </label>
-    <button id="btn" onclick="signIn()">Sign in</button>
+    <button id="btn" type="submit">Sign in</button>
     <div class="err" id="err"></div>
+    </form>
     <div class="err" id="deactivated-msg" style="display:none;background:#eef2ff;color:#32217c;">Your account has been deactivated. Contact an administrator if you'd like access restored.</div>
   </div>
 
   <div class="card" id="forgot-card" style="display:none;">
     <h1 style="margin-top:0;">Reset your password</h1>
     <div class="sub">Enter your email and we'll send you a reset link, if an account exists.</div>
+    <form id="forgot-password-form" onsubmit="event.preventDefault();sendForgot()">
     <label for="forgot-email">Email</label>
     <input id="forgot-email" type="email" autocomplete="username" placeholder="you@company.com">
-    <button id="forgot-btn" onclick="sendForgot()">Send reset link</button>
+    <button id="forgot-btn" type="submit">Send reset link</button>
     <div style="text-align:center;margin-top:16px;"><a href="#" onclick="hideForgot(event)" style="font-size:12.5px;font-weight:700;color:var(--grey);text-decoration:none;">← Back to sign in</a></div>
+    </form>
     <div class="err" id="forgot-msg" style="display:none;background:#e7f7ef;color:#137a47;"></div>
   </div>
   <div style="text-align:center;margin-top:18px;font-size:12px;color:#8497a7;">

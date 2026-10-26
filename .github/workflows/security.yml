@@ -1,0 +1,21 @@
+name: Source security and form regression
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify authentication form associations
+        run: node scripts/password-form-regression.mjs
+      - name: Verify credential scanner and tracked-file hygiene
+        run: node --test scripts/security/scan-secrets.test.mjs && node scripts/security/scan-secrets.mjs

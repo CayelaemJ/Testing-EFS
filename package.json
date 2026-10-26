@@ -20,7 +20,8 @@
     "db:rebuild-scores": "tsx scripts/rebuild-score-snapshots.ts",
     "security:audit": "npm audit --audit-level=high",
     "check:security": "node scripts/security-regression-check.mjs",
-    "sync:configure": "node scripts/configure-mysql-sync.mjs"
+    "sync:configure": "node scripts/configure-mysql-sync.mjs",
+    "check:password-forms": "node scripts/password-form-regression.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^9.3.1",

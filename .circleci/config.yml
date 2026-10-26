@@ -1,0 +1,21 @@
+version: 2.1
+jobs:
+  security:
+    docker:
+      - image: cimg/node:22.18
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Check password form semantics and activation
+          command: node scripts/password-form-regression.mjs
+      - run:
+          name: Verify redacted credential scanner regressions
+          command: node --test scripts/security/scan-secrets.test.mjs
+      - run:
+          name: Reject committed live credential material
+          command: node scripts/security/scan-secrets.mjs
+workflows:
+  security_pull_requests:
+    jobs:
+      - security

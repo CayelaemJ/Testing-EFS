@@ -150,7 +150,7 @@ app.setErrorHandler((error, req, reply) => {
   req.log.error({ err: error, method: req.method, url: req.url }, "unhandled request error");
   if (reply.sent) return;
   const status = Number((error as any)?.statusCode);
-  if (status >= 400 && status < 500) return reply.code(status).send({ error: error.message || "request rejected" });
+  if (status >= 400 && status < 500) return reply.code(status).send({ error: error instanceof Error ? error.message : "request rejected" });
   return reply.code(500).send({ error: "internal server error" });
 });
 
@@ -165,11 +165,11 @@ app.register(fastifyStatic, {
   // The portal HTML is deployed independently of browser cache state. UI assets
   // are intentionally no-store while the product is pre-live so a deployment
   // cannot appear to retain an older navigation/integration screen.
-  setHeaders(res, filePath) {
+  setHeaders(reply, filePath) {
     if (/\.(?:js|css|html)$/i.test(filePath)) {
-      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
+      reply.header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      reply.header("Pragma", "no-cache");
+      reply.header("Expires", "0");
     }
   },
 });

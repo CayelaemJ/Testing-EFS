@@ -17,7 +17,7 @@ import { prisma, snapshotEmployer, getDashboardPayload, monthKey } from "./servi
 import { REPORT_FORMATS, LOAD_ORDER, getFormat } from "./services/reportFormats.js";
 import { csvTemplate, xlsxTemplate, formatManifest } from "./services/templateGenerator.js";
 import { revertBatch, resetAllData } from "./services/importService.js";
-import { startUploadJob, getUploadJob, startCommitJob, getCommitJob } from "./services/asyncJobs.js";
+import { startUploadJob, getUploadJob, startCommitJob, getCommitJob, startSyncJob, getSyncJob } from "./services/asyncJobs.js";
 import { getConfig as getSyncConfig, saveConfig as saveSyncConfig, publicConfig as publicSyncConfig, testConnection as testSyncConnection, runSync, recentSyncLogs } from "./services/syncService.js";
 import { listPartners, createPartner, updatePartner, deletePartner, assignUserToPartner, assignEmployerToPartner, themeForUser, themeForSlug } from "./services/partnerService.js";
 import { login, resolveSession, destroySession, canViewEmployer, canAccessModule, allowedEmployerIds } from "./services/authService.js";
@@ -102,8 +102,19 @@ app.addHook("onRequest", async (req, reply) => {
         reply.header("Pragma", "no-cache");
     }
     const ip = req.ip || "unknown";
-    const authPath = path === "/api/auth/login" || path === "/api/auth/forgot-password" || path === "/api/auth/set-password";
-    if (!rateLimit(reply, `${authPath ? "auth" : "api"}:${ip}`, authPath ? AUTH_RATE_LIMIT : RATE_LIMIT, authPath ? AUTH_WINDOW_MS : RATE_WINDOW_MS))
+    // Apply a general budget first; sensitive APIs have independent, tighter limits.
+    if (!rateLimit(reply, `api:${ip}`, RATE_LIMIT, RATE_WINDOW_MS))
+        return;
+    const authPath = /^\/api\/auth\/(?:login|forgot-password|set-password)(?:\/|$)/.test(path);
+    if (authPath && !rateLimit(reply, `auth:${ip}`, AUTH_RATE_LIMIT, AUTH_WINDOW_MS))
+        return;
+    if (path === "/api/contact" && !rateLimit(reply, `contact:${ip}`, 6, 10 * 60_000))
+        return;
+    if (/\/(?:upload|import|batch|sync|staging|dataset)(?:s|\/|-|$)/.test(path) &&
+        !rateLimit(reply, `bulk:${ip}`, 20, 10 * 60_000))
+        return;
+    if (/\/(?:report|export|analytics)(?:s|\/|-|$)/.test(path) &&
+        !rateLimit(reply, `reports:${ip}`, 40, 60_000))
         return;
     // Cookie-authenticated state-changing API calls must originate from this
     // application. Bearer-token API clients are exempt because they don't carry
@@ -142,7 +153,7 @@ app.setErrorHandler((error, req, reply) => {
         return;
     const status = Number(error?.statusCode);
     if (status >= 400 && status < 500)
-        return reply.code(status).send({ error: error.message || "request rejected" });
+        return reply.code(status).send({ error: error instanceof Error ? error.message : "request rejected" });
     return reply.code(500).send({ error: "internal server error" });
 });
 app.register(cookie);
@@ -155,11 +166,11 @@ app.register(fastifyStatic, {
     // The portal HTML is deployed independently of browser cache state. UI assets
     // are intentionally no-store while the product is pre-live so a deployment
     // cannot appear to retain an older navigation/integration screen.
-    setHeaders(res, filePath) {
+    setHeaders(reply, filePath) {
         if (/\.(?:js|css|html)$/i.test(filePath)) {
-            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-            res.setHeader("Pragma", "no-cache");
-            res.setHeader("Expires", "0");
+            reply.header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+            reply.header("Pragma", "no-cache");
+            reply.header("Expires", "0");
         }
     },
 });
@@ -689,10 +700,27 @@ app.post("/api/admin/integration/test", async (req, reply) => {
         return;
     return testSyncConnection((req.body || {}));
 });
+// Trigger an integration sync (API or SQL). Returns 202 immediately; the
+// browser polls /api/admin/sync-jobs/:jobId. Pulling and validating a full
+// dataset from an external source can take minutes, and doing it inline on
+// the request used to hang the HTTP connection until it finished.
 app.post("/api/admin/integration/sync", async (req, reply) => {
     if (!(await requireAdmin(req, reply)))
         return;
-    return runSync("manual");
+    const jobId = startSyncJob("manual");
+    return reply.code(202).send({ status: "ACCEPTED", jobId });
+});
+app.get("/api/admin/sync-jobs/:jobId", async (req, reply) => {
+    if (!(await requireAdmin(req, reply)))
+        return;
+    const job = getSyncJob(req.params.jobId);
+    if (!job)
+        return reply.code(404).send({ error: "unknown sync job" });
+    if (job.status === "PENDING")
+        return { status: "PROCESSING" };
+    if (job.status === "FAILED")
+        return { status: "FAILED", error: job.error };
+    return { status: "DONE", ...job.result };
 });
 app.get("/api/admin/integration/logs", async (req, reply) => {
     if (!(await requireAdmin(req, reply)))

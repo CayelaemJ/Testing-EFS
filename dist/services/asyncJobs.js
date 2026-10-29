@@ -6,14 +6,20 @@
 // ════════════════════════════════════════════════════════════════════
 import { randomUUID } from "node:crypto";
 import { uploadAndValidate, commitBatch } from "./importService.js";
+import { runSync } from "./syncService.js";
 const uploadJobs = new Map();
 const commitJobs = new Map();
+const syncJobs = new Map();
 // Jobs expire after 30 minutes so the maps don't grow forever.
 function startJob(map) {
     const id = randomUUID();
     const timer = setTimeout(() => map.delete(id), 30 * 60 * 1000);
     map.set(id, { status: "PENDING", timer });
     return id;
+}
+function currentPeriod() {
+    const d = new Date();
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 export function startUploadJob(opts) {
     const jobId = startJob(uploadJobs);
@@ -32,7 +38,7 @@ export function startUploadJob(opts) {
                 errorSummary: "",
                 missingColumns: result.missingColumns,
                 unknownColumns: result.unknownColumns,
-                preview: result.rows.slice(0, 10),
+                preview: result.rows.slice(0, 3),
             };
             // If validation failed, don't auto-commit
             if (!result.ok || batch?.status !== "VALIDATED") {
@@ -49,6 +55,7 @@ export function startUploadJob(opts) {
                 errorCount: 0,
                 errorSummary: "",
                 ...commit,
+                period: currentPeriod(),
             };
         }
         catch (e) {
@@ -80,7 +87,7 @@ export function startCommitJob(batchId) {
         try {
             const result = await commitBatch(batchId);
             job.status = "DONE";
-            job.result = result;
+            job.result = { ...result, period: currentPeriod() };
         }
         catch (e) {
             job.status = "FAILED";
@@ -92,4 +99,27 @@ export function startCommitJob(batchId) {
 }
 export function getCommitJob(jobId) {
     return commitJobs.get(jobId);
+}
+// Integration syncs (API or SQL) can take minutes for large datasets.
+// Run them in the background and let the browser poll
+// /api/admin/sync-jobs/:jobId, same pattern as uploads/commits.
+export function startSyncJob(trigger = "manual") {
+    const jobId = startJob(syncJobs);
+    const job = syncJobs.get(jobId);
+    (async () => {
+        try {
+            const result = await runSync(trigger);
+            job.status = "DONE";
+            job.result = result;
+        }
+        catch (e) {
+            job.status = "FAILED";
+            job.error = e?.message || String(e);
+            console.error("[sync-job] sync failed:", e);
+        }
+    })();
+    return jobId;
+}
+export function getSyncJob(jobId) {
+    return syncJobs.get(jobId);
 }

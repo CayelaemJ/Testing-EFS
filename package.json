@@ -24,9 +24,9 @@
     "check:password-forms": "node scripts/password-form-regression.mjs"
   },
   "dependencies": {
-    "@fastify/cookie": "^9.3.1",
-    "@fastify/multipart": "^8.3.0",
-    "@fastify/static": "^7.0.4",
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/multipart": "^10.1.6",
+    "@fastify/static": "^10.1.8",
     "@prisma/client": "^5.22.0",
     "@types/node": "^22.9.0",
     "csv-parse": "^7.0.2",

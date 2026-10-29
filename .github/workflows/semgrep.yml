@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Keep the scanner version pinned to the version used to validate this workflow.
       - name: Install Semgrep
         run: pipx install semgrep==1.182.1
       - name: Scan application code

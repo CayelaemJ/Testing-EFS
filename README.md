@@ -1,3 +1,7 @@
+> 📐 **[Explore the project architecture, diagrams and technical deep dive](docs/PORTFOLIO_SHOWCASE.md)** · [Engineering profile](https://github.com/CayelaemJ)
+
+---
+
 ## v0.5.4 metric help
 
 Employer view now uses the same accessible information icons as Portfolio view. Hover, focus or click an **i** icon to see a plain-language definition and calculation for the measure. The glossary covers the executive summary, score and drivers, KPIs, funnel, outcomes, value, debt, EWA, stress, ratings, risk, opportunities and separate chat metrics.
